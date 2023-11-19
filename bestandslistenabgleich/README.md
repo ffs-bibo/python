@@ -30,6 +30,7 @@ Das wäre dann:
 * Inventarnummer (diese beinhaltet meiner Beobachtung nach bereits das Jahr in zweistelliger Form)
 * Autor
 * Titel
+* Exzerpt/Inhaltsbeschreibung
 * Serie
 * Kategorie
 * Verlag (?)
