@@ -1,2 +1,6 @@
-black
+beautifulsoup4
 flake8
+isbnlib
+ruff
+scrapy
+vulture
