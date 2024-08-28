@@ -81,13 +81,20 @@ def read_sba_format(inp):
     systematik = set()
     isbn_set = set()
     noisbn_list = []
+    strange_isbns = []
+    invalid_isbns = []
     for row in reader:
         if count > 0:
             systematik.add(row[0])
-            if row[4]:
+            if row[4].strip():
                 isbn = canonical(row[4] if is_isbn13(row[4]) else to_isbn13(row[4]))
-                print(f"{isbn}")
-                isbn_set.add(isbn)
+                if isbn:
+                    print(f"{isbn}")
+                    isbn_set.add(isbn)
+                    if not isbn.startswith("9783"):
+                        strange_isbns.append(isbn)
+                else:
+                    invalid_isbns.append(row)
             else:
                 print(f"{row[1]}")
                 noisbn_list.append(row[1:3])
@@ -95,11 +102,19 @@ def read_sba_format(inp):
     print(repr(systematik))
     print(f"{len(systematik)=}")
     print(f"{len(isbn_set)=}")
+    print(f"{len(strange_isbns)=}")
+    if len(strange_isbns) < 100:
+        for entry in strange_isbns:
+            print(f"Seltsame ISBN: {entry}")
+            #print(f"{entry}")
     print(f"{len(noisbn_list)=}")
     if len(noisbn_list) < 100:
         for entry in noisbn_list:
-            # print(f"KEINE ISBN: {entry}")
-            print(f"{entry[0]}")
+            print(f"KEINE ISBN: {entry}")
+            # print(f"{entry[0]}")
+    if len(invalid_isbns) < 100:
+        for row in invalid_isbns:
+            print(f"Ungültige ISBN?: {row=}")
 
 
 def read_own_format(inp):
