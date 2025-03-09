@@ -18,7 +18,7 @@ from __future__ import (
 
 __author__ = "Oliver Schneider"
 __copyright__ = "2024, 2025 Oliver Schneider (assarbad.net), under the terms of the UNLICENSE"
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __compatible__ = (
     (3, 12),
     (3, 13),
@@ -35,7 +35,9 @@ import re
 import sys
 import random
 import requests
+import time
 from bs4 import BeautifulSoup
+from contextlib import suppress
 from functools import cache
 from pathlib import Path
 from typing import Union, List
@@ -131,8 +133,8 @@ class SBASearch(object):
         )
         log.debug("User-Agent: %s", self.session.headers["User-Agent"])
         self.initial_rsp = self.session.get(url)
-        self.initial_soup = BeautifulSoup(self.initial_rsp.content, "html.parser")
-        log.debug("%d Byte(s) mit HTTP-Code: %d", len(self.initial_rsp.content), self.initial_rsp.status_code)
+        self.initial_soup = BeautifulSoup(self.initial_rsp.text, "html.parser")
+        log.debug("%d Byte(s) mit HTTP-Code: %d", len(self.initial_rsp.text), self.initial_rsp.status_code)
         forms = self.initial_soup.find_all("form")
         # Wir sollten nur ein <form /> vorfinden
         assert len(forms) == 1, f"Es wurde nur ein Suchformular auf der Suchseite erwartet (sehe {len(forms)=})"
@@ -219,15 +221,15 @@ class SBASearch(object):
     def items(self):
         form_data = self.prepare_post_data()
         self.response = self.session.post(self.searchaction_url, data=form_data)
-        if self.response.status_code >= 400:
+        if self.response.status_code >= 300:  # Umleitungen aus dem 300er-Bereich sollten hier nicht auftauchen, weil die Requests normalerweise befolgt
             log.critical(f"POST gab Status {self.response.status_code} zurück (URL: {self.searchaction_url}).")
-            return None
+            raise RuntimeError(f"HTTP-Status[POST]: {self.response.status_code} (URL: {self.searchaction_url})")
         # Hier sollten wir einen searchhash vorfinden
         assert (
             "searchhash=OCLC_" in self.response.url
         ), f"Es wurde erwartet einen 'searchhash' der mit 'OCLC_' beginnt in der URL für die Ergebnisliste vorzufinden."
-        log.info("URL des Suchergebnisses: %s (Status: %d); Bytes: %d", self.response.url, self.response.status_code, len(self.response.content))
-        soup = BeautifulSoup(self.response.content, "html.parser")
+        log.info("URL des Suchergebnisses: %s (Status: %d); Bytes: %d", self.response.url, self.response.status_code, len(self.response.text))
+        soup = BeautifulSoup(self.response.text, "html.parser")
         item_total = soup.find_all("span", {"id": lambda x: x and x.endswith("_TotalItemsLabel")})
         assert len(item_total) == 2, f"Es wurde erwartet, daß die Gesamttrefferzahl exakt zweimal (oben + unten) in der Ergebnisliste auftaucht: {item_total!r}"
         item_total_text = item_total[0].get_text()
@@ -236,8 +238,8 @@ class SBASearch(object):
             item_total = int(match.group(1), 10)
             log.info("Treffer: %d", item_total)
         else:
-            # Das ist kein Riesenproblem, weil wir noch immer auf jeder Trefferseite "x von y" angezeigt bekommen sollten
-            log.warning("Konnte nicht ermitteln wie viele Treffer es gab: %r", item_total_text)
+            log.critical("Konnte nicht ermitteln wie viele Treffer es gab: %r", item_total_text)
+            raise RuntimeError(f"Trefferzahl nicht ermittelbar: {item_total_text!r}")
         item_links = soup.find_all("a", {"id": lambda x: x and x.endswith("_LbtnShortDescriptionValue")})
         assert len(item_links) > 0, f"Es wurde mehr als ein Ergebnis in der Trefferliste erwartet: {len(item_links)=}"
         result_url = item_links[0].get("href", None)
@@ -246,11 +248,10 @@ class SBASearch(object):
         assert "searchhash=OCLC_" in result_url, f"Es wurde erwartet einen 'searchhash' der mit 'OCLC_' beginnt im ersten Ergebnislink vorzufinden."
         template_url = result_url.replace("&detail=0&", "&detail={item_index}&")
         log.info("Die ermittelte _generische_ URL für Ergebnisdetails lautet: %s", template_url)
-        # TODO/FIXME: falls wir in dieses Problem laufen, sollten wir die Trefferanzahl halt später ermitteln
 
         def get_detail_url():
             for idx in range(0, item_total):
-                yield template_url.format(item_index=idx)
+                yield idx, template_url.format(item_index=idx)
 
         return get_detail_url()
 
@@ -294,6 +295,35 @@ class SBASearch(object):
         elems = self.searchform.find_all(xmltype, attrs=attrs)
         assert len(elems) == 1, f"Es wurde nur ein Element zurückerwartet (habe {len(elems)=}, {xmltype!r}, {attrs=})"
         return elems[0] if len(elems) == 1 else None
+
+    @cache
+    def get_cache_path(self) -> Path:
+        return Path(__file__).resolve().parent / "cache"
+
+    @cache
+    def get_cached_content(self, idx: int, url: str):
+        cache_path = self.get_cache_path()
+        cache_path.mkdir(parents=True, exist_ok=True)
+        cache_filepath = self.get_cache_path() / f"detail_{idx:04d}.html"
+        with suppress(FileNotFoundError):
+            with open(cache_filepath, "r") as cache_file:
+                log.debug("Cache-Treffer: #%d -> %s", idx, url)
+                return cache_file.read()
+        # Wir machen das _vor_ dem nächsten with-Bereich, damit wir möglichst keine leeren Dateien erzeugen
+        details = self.session.get(url)
+        if details.status_code >= 300:  # Umleitungen aus dem 300er-Bereich sollten hier nicht auftauchen, weil die Requests normalerweise befolgt
+            log.critical(f"GET gab Status {details.status_code} zurück (URL: {url}).")
+            raise RuntimeError(f"HTTP-Status[GET]: {details.status_code} (URL: {url})")
+        with open(cache_filepath, "w") as cache_file:
+            cache_file.write(details.text)
+        delay = random.choice(range(250, 1000))  # in Millisekunden
+        log.debug("Cache-Fehlschlag: #%d -> %s (Verzögerung %d ms})", idx, url, delay)
+        time.sleep(delay / 1000)
+        return details.text
+
+    def get_details(self, idx: int, url: str):
+        details = self.get_cached_content(idx, url)
+        soup = BeautifulSoup(details, "html.parser")
 
 
 def setup_logging(verbosity: int):
@@ -343,8 +373,8 @@ def main(**kwargs):
     url = kwargs.get("url", None)
     assert url is not None, f"Die Einstiegs-URL kann nicht 'nichts' (None) sein."
     search = SBASearch(url)
-    for detail_url in search.items():
-        print(detail_url)
+    for idx, detail_url in search.items():
+        search.get_details(idx, detail_url)
 
 
 if __name__ == "__main__":
