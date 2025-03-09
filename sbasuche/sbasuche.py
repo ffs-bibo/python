@@ -118,7 +118,7 @@ class SBASearch(object):
                 "User-Agent": random.choice(self.__useragents),  # beliebiger User-Agent
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.5",
-                "Accept-Encoding": "gzip, deflate", # das sind jene die Requests von Haus aus unterstützt
+                "Accept-Encoding": "gzip, deflate",  # das sind jene die Requests von Haus aus unterstützt
                 "Connection": "keep-alive",
                 "Upgrade-Insecure-Requests": "1",
                 "Sec-Fetch-Dest": "document",
@@ -223,7 +223,9 @@ class SBASearch(object):
             log.critical(f"POST gab Status {self.response.status_code} zurück (URL: {self.searchaction_url}).")
             return None
         # Hier sollten wir einen searchhash vorfinden
-        assert "searchhash=OCLC_" in self.response.url, f"Es wurde erwartet einen 'searchhash' der mit 'OCLC_' beginnt in der URL für die Ergebnisliste vorzufinden."
+        assert (
+            "searchhash=OCLC_" in self.response.url
+        ), f"Es wurde erwartet einen 'searchhash' der mit 'OCLC_' beginnt in der URL für die Ergebnisliste vorzufinden."
         log.info("URL des Suchergebnisses: %s (Status: %d); Bytes: %d", self.response.url, self.response.status_code, len(self.response.content))
         soup = BeautifulSoup(self.response.content, "html.parser")
         item_total = soup.find_all("span", {"id": lambda x: x and x.endswith("_TotalItemsLabel")})
@@ -251,7 +253,6 @@ class SBASearch(object):
                 yield template_url.format(item_index=idx)
 
         return get_detail_url()
-
 
     @staticmethod
     def get_values(bsresultset):
