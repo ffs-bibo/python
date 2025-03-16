@@ -18,7 +18,7 @@ from __future__ import (
 
 __author__ = "Oliver Schneider"
 __copyright__ = "2024, 2025 Oliver Schneider (assarbad.net), under the terms of the UNLICENSE"
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __compatible__ = (
     (3, 12),
     (3, 13),
@@ -40,7 +40,7 @@ from bs4 import BeautifulSoup
 from contextlib import suppress
 from functools import cache
 from pathlib import Path
-from typing import Union, List
+from typing import Union, List, Optional
 from urllib.parse import urlparse
 
 # Checking for compatibility with Python version
@@ -65,6 +65,14 @@ def parse_args():
         help="Unterdrücke die Ausgabe des Logos dieses Skripts.",
     )
     parser.add_argument(
+        "-c",
+        "--cache",
+        action="store_const",
+        dest="cache",
+        const=True,
+        help="Unterdrücke erneute Abfrage der Online-Quelle der SBA. Stattdessen wird der Cache bemüht (sofern verfügbar).",
+    )
+    parser.add_argument(
         "-u",
         "--url",
         dest="url",
@@ -80,6 +88,50 @@ def parse_args():
         default=0,
     )
     return parser.parse_args()
+
+
+def setup_logging(verbosity: int):
+    """\
+    Initialisierung des Loggens in eine Datei und auf sys.stderr
+    """
+    # Ausführlichkeit wird als globale Variable verfügbar gemacht
+    global verbose
+    verbose = verbosity
+
+    script_filename = Path(__file__).resolve()
+    log_filename = f"{script_filename.stem}.log"
+    log_filepath = script_filename.parent / log_filename
+
+    logger = logging.getLogger(str(script_filename))
+    logger.setLevel(logging.DEBUG)
+
+    conlog = logging.StreamHandler(sys.stderr)
+    filelog = logging.FileHandler(log_filepath)
+
+    conloglvl = logging.WARNING
+    if verbosity > 1:
+        conloglvl = logging.DEBUG
+    elif verbosity > 0:
+        conloglvl = logging.INFO
+    conlog.setLevel(conloglvl)
+    filelog.setLevel(logging.DEBUG)
+
+    confmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S")
+    filefmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%dT%H:%M:%S")
+    conlog.setFormatter(confmt)
+    filelog.setFormatter(filefmt)
+
+    logger.addHandler(conlog)
+    logger.addHandler(filelog)
+
+    logger.debug("Logging initialisiert")
+    return logger
+
+
+class SBARequestError(RuntimeError): ...
+
+
+class SBALogicError(RuntimeError): ...
 
 
 class SBASearch(object):
@@ -106,12 +158,15 @@ class SBASearch(object):
     __mediatype_default_value = 2  # 0 == alle, 1 == E-Medien, 2 == phys. Medien
     __searchuri_default_value = "/A-F/Friedrich-Fr%C3%B6bel-Schule"  # "/Mediensuche/Erweiterte-Suche" # "/Mediensuche/Einfache-Suche"
 
-    def __init__(self, url: str):
+    def __init__(self, url: str, cache: bool):
         """\
         Initialisierer für unsere Hilfsklasse zur SBA-Suche.
 
         Hier werden u.a. bestimmte Annahmen überprüft und auch Elemente ermittelt, deren Inhalte irgendwie für die weiteren Abfragen relevant sind.
         """
+        self.cache = cache
+        if self.cache:
+            return
         self.matching_item_re = re.compile(r"^(\d+?)\s+?Treffer$")
         self.session = requests.Session()
         # Die Standard HTTP-Header welche wir immer mitschicken wollen
@@ -135,6 +190,9 @@ class SBASearch(object):
         self.initial_rsp = self.session.get(url)
         self.initial_soup = BeautifulSoup(self.initial_rsp.text, "html.parser")
         log.debug("%d Byte(s) mit HTTP-Code: %d", len(self.initial_rsp.text), self.initial_rsp.status_code)
+        if self.initial_rsp.status_code not in range(100,400):
+            log.critical("%d Byte(s) mit HTTP-Code: %d", len(self.initial_rsp.text), self.initial_rsp.status_code)
+            raise SBARequestError(f"HTTP-Status[GET]: {self.initial_rsp.status_code} (URL: {url})")
         forms = self.initial_soup.find_all("form")
         # Wir sollten nur ein <form /> vorfinden
         assert len(forms) == 1, f"Es wurde nur ein Suchformular auf der Suchseite erwartet (sehe {len(forms)=})"
@@ -218,12 +276,28 @@ class SBASearch(object):
         form_data.update(SBASearch.get_namevalue_dict(self.hidden_fields))
         return form_data
 
+    def cached_items(self):
+        cache_basepath = self.get_cache_basepath()
+        cached_searchhashes = [d for d in cache_basepath.iterdir() if d.is_dir() and d.stem.startswith("OCLC_")]
+        if not cached_searchhashes:
+            ... # FIXME: error
+        newest_cache_dir = sorted(cached_searchhashes, key=lambda d: d.stat().st_mtime)[-1]
+        cache_file_list = sorted([cache_file for cache_file in newest_cache_dir.glob("detail_????.html")])
+        assert cache_file_list, f"Es wurde kein gültiges bereits zwischengespeichertes Verzeichnis gefunden (habe versucht: {newest_cache_dir})."
+        assert cache_file_list[0].name == "detail_0000.html", f"Der erste Eintrag der Cache-List hätte 'detail_0000.html' sein sollen ({len(cache_file_list)=})."
+        def get_detail_url():
+            for idx, cache_file in enumerate(cache_file_list):
+                yield idx, cache_file
+        return get_detail_url()
+
     def items(self):
+        if self.cache:  # sidestep the online stuff
+            return self.cached_items()
         form_data = self.prepare_post_data()
         self.response = self.session.post(self.searchaction_url, data=form_data)
         if self.response.status_code >= 300:  # Umleitungen aus dem 300er-Bereich sollten hier nicht auftauchen, weil die Requests normalerweise befolgt
             log.critical(f"POST gab Status {self.response.status_code} zurück (URL: {self.searchaction_url}).")
-            raise RuntimeError(f"HTTP-Status[POST]: {self.response.status_code} (URL: {self.searchaction_url})")
+            raise SBARequestError(f"HTTP-Status[POST]: {self.response.status_code} (URL: {self.searchaction_url})")
         # Hier sollten wir einen searchhash vorfinden
         assert (
             "searchhash=OCLC_" in self.response.url
@@ -239,7 +313,7 @@ class SBASearch(object):
             log.info("Treffer: %d", item_total)
         else:
             log.critical("Konnte nicht ermitteln wie viele Treffer es gab: %r", item_total_text)
-            raise RuntimeError(f"Trefferzahl nicht ermittelbar: {item_total_text!r}")
+            raise SBALogicError(f"Trefferzahl nicht ermittelbar: {item_total_text!r}")
         item_links = soup.find_all("a", {"id": lambda x: x and x.endswith("_LbtnShortDescriptionValue")})
         assert len(item_links) > 0, f"Es wurde mehr als ein Ergebnis in der Trefferliste erwartet: {len(item_links)=}"
         result_url = item_links[0].get("href", None)
@@ -297,23 +371,42 @@ class SBASearch(object):
         return elems[0] if len(elems) == 1 else None
 
     @cache
-    def get_cache_path(self) -> Path:
-        return Path(__file__).resolve().parent / "cache"
+    def get_cache_basepath(self) -> Path:
+        retval = Path(__file__).resolve().parent / "cache"
+        return retval
 
     @cache
-    def get_cached_content(self, idx: int, url: str):
-        cache_path = self.get_cache_path()
-        cache_path.mkdir(parents=True, exist_ok=True)
-        cache_filepath = self.get_cache_path() / f"detail_{idx:04d}.html"
+    def get_cache_path(self, searchhash: str) -> Path:
+        retval = self.get_cache_basepath() / searchhash
+        log.info("Cache-Pfad = %s", retval)
+        return retval
+
+    @cache
+    def get_cached_content(self, idx: int, url: Union[str, Path]):
+        force_cache = not isinstance(url, str)
+        if not force_cache:
+            parsed_url = urlparse(url)
+            assert parsed_url.query, f"Die Query in der URL hätte nicht leer sein dürfen! ({url=})"
+            assert "&" in parsed_url.query, f"Es wurde ein '&' in der Query ({url=}) erwartet"
+            assert "searchhash=" in parsed_url.query, f"Es wurde ein 'searchhash=' in der URL ({url=}) erwartet"
+            searchhash = [x for x in url.split("?")[1].split("&") if x.startswith("searchhash=")][0].split("=")[1]
+            cache_path = self.get_cache_path(searchhash)
+            cache_path.mkdir(parents=True, exist_ok=True)
+            cache_filepath = cache_path / f"detail_{idx:04d}.html"
+        else:
+            cache_filepath = url
         with suppress(FileNotFoundError):
             with open(cache_filepath, "r") as cache_file:
                 log.debug("Cache-Treffer: #%d -> %s", idx, url)
                 return cache_file.read()
+        if force_cache:
+            log.critical(f"Es war nicht möglich den Cache für die angefragte Datei auszulesen ({idx=}; {cache_filepath=}).")
+            raise SBALogicError(f"Es war nicht möglich den Cache für die angefragte Datei auszulesen ({idx=}; {cache_filepath=}).")
         # Wir machen das _vor_ dem nächsten with-Bereich, damit wir möglichst keine leeren Dateien erzeugen
         details = self.session.get(url)
         if details.status_code >= 300:  # Umleitungen aus dem 300er-Bereich sollten hier nicht auftauchen, weil die Requests normalerweise befolgt
             log.critical(f"GET gab Status {details.status_code} zurück (URL: {url}).")
-            raise RuntimeError(f"HTTP-Status[GET]: {details.status_code} (URL: {url})")
+            raise SBARequestError(f"HTTP-Status[GET]: {details.status_code} (URL: {url})")
         with open(cache_filepath, "w") as cache_file:
             cache_file.write(details.text)
         delay = random.choice(range(250, 1000))  # in Millisekunden
@@ -321,66 +414,145 @@ class SBASearch(object):
         time.sleep(delay / 1000)
         return details.text
 
-    def get_details(self, idx: int, url: str):
+    def get_details_soup(self, idx: int, url: str):
         details = self.get_cached_content(idx, url)
-        soup = BeautifulSoup(details, "html.parser")
+        return BeautifulSoup(details, "html.parser")
 
 
-def setup_logging(verbosity: int):
-    """\
-    Initialisierung des Loggens in eine Datei und auf sys.stderr
-    """
-    # Ausführlichkeit wird als globale Variable verfügbar gemacht
-    global verbose
-    verbose = verbosity
+class SearchSoup(object):
+    def __init__(self, soup):
+        self.soup = soup
+        self.__parse()
 
-    script_filename = Path(__file__).resolve()
-    log_filename = f"{script_filename.stem}.log"
-    log_filepath = script_filename.parent / log_filename
+    @property
+    @cache
+    def prefix(self):
+        anyelem = self.soup.find_all("div", {"id": lambda x: x and x.endswith("_MainView_UcDetailView_CatalogueDetailView")})
+        assert len(anyelem) == 1, f"Es wird erwartet daß nur ein Element mit der gesuchten ID existiert ({anyelem=!r})"
+        anyelem = anyelem[0]
+        anyid = anyelem.get("id")
+        idre = re.compile(r"^(dnn_ctr\d+?)_")
+        if match:= idre.match(anyid):
+            return match.group(1)
+        log.critical("Die ID (%r) stimmte nicht mit der Regex (%r) überein",anyid, idre.pattern)
+        log.debug("Präfix für IDs: %s", prefix)
+        raise SBALogicError(f"Die ID ({anyid!r}) stimmte nicht mit der Regex ({idre.pattern!r}) überein")
+        
 
-    logger = logging.getLogger(str(script_filename))
-    logger.setLevel(logging.DEBUG)
+    def __parse(self):
+        soup = self.soup
+        prefix = self.prefix
+        # Autoren/Beteiligte
+        author_links = [x.get_text() for x in self.find_all(attrs={
+            "id": re.compile(fr"^{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LVAuthorValue_LinkAuthor_[0-9]+$"),
+            "aria-describedby": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_ScreenReaderAuthorLink",
+            })]
+        # Von/Mit
+        responsibility = [x.get_text() for x in self.find_all(attrs={
+            "id": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LblStatementOfResponsibilityValue",
+            })]
+        # Erscheinungsjahr usw.
+        publish_year = [x.get_text() for x in self.find_all(attrs={
+            "id": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LblProductionYearValue",
+            })]
+        # Ort, Verlag/Herausgeber/Hersteller
+        publisher = [x.get_text() for x in self.find_all(attrs={
+            "id": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LblManufacturerValue",
+            })]
+        # Systematiken
+        systematics = [x.get_text() for x in self.find_all(attrs={
+            "id": re.compile(fr"^{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LVSystematicValue_LinkSystematic_[0-9]+$"),
+            "aria-describedby": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_ScreenReaderSystematicLink",
+            })]
+        # Interessenkreis
+        systematics = [x.get_text() for x in self.find_all(attrs={
+            "id": re.compile(fr"^{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LVSubjectTypeValue_LinkSubjectType_[0-9]+$"),
+            "aria-describedby": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_ScreenReaderSubjectType",
+            })]
+        # ISBN
+        isbn = [x.get_text() for x in self.find_all(attrs={
+            "id": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_Lbl1stIsbnValue", #FIXME/TODO: gibt es weitere?
+            })]
+        # Beschreibung
+        description = [x.get_text() for x in self.find_all(attrs={
+            "id": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LblDescriptionValue",
+            })]
+        # Exzerpt
+        excerpt = [x.get_text() for x in self.find_all(attrs={
+            "id": f"{prefix}_MainView_UcDetailView_CatalogueContent",
+            })]
+        copies_table = self.find_all("table", {"id": f"{prefix}_MainView_UcDetailView_ucCatalogueCopyView_grdViewMediumCopies"})
+        assert len(copies_table) == 1, f"Es kann nur eine Tabelle mit Exemplaren geben. Habe {len(copies_table)=}."
+        if copies_table and len(copies_table) == 1:
+            copy_cols = [x.get("abbr", None) or x.get_text() for x in copies_table[0].find_all("th", attrs={"scope": "col"})]
+            assert set(copy_cols) == {"Schulbibliothek", "Standorte", "Status", "Rückgabedatum"}, f"Die Spalten stimmen nicht mit unseren Annahmen überein. Zeit das Skript anzupassen."
+            print(f"{copy_cols=}")
 
-    conlog = logging.StreamHandler(sys.stderr)
-    filelog = logging.FileHandler(log_filepath)
+                
 
-    conloglvl = logging.WARNING
-    if verbosity > 1:
-        conloglvl = logging.DEBUG
-    elif verbosity > 0:
-        conloglvl = logging.INFO
-    conlog.setLevel(conloglvl)
-    filelog.setLevel(logging.DEBUG)
+        print(f"{author_links=}")
+        print(f"{systematics=}")
+        print(f"{responsibility=}")
+        print(f"{isbn=}")
+        print(f"{description=}")
+        print(f"{excerpt=}")
+        print(f"{publisher=}; {publish_year=}")
 
-    confmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S")
-    filefmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%dT%H:%M:%S")
-    conlog.setFormatter(confmt)
-    filelog.setFormatter(filefmt)
+        # div: "_MainView_UcDetailView_CatalogueCopyView" (Anzahl Exemplare in der jeweiligen Bücherei)
+        #   tr -> th (Spaltentitel)
+        #   tr -> td (eigentliche Zeilen)
+        #   <td><span class="oclc-module-view-small oclc-module-label">Standorte:</span><span>1.2 Zusa / Bilderbuch</span></td>
+        #   Anmerkung: Status ist hier bspw. "In Einarbeitung" für neue Bücherlieferungen seitens der SBA
+        # soup.find_all('a', id=re.compile(r'^link'))
 
-    logger.addHandler(conlog)
-    logger.addHandler(filelog)
+    def find_all(self, xmltype: Optional[Union[str, List[str]]] = None, attrs: dict = {}, soup= None):
+        """\
+        Sucht innerhalb der hübschen Suppe Elemente.
+        """
+        soup = soup or self.soup
+        return soup.find_all(xmltype, attrs=attrs) if xmltype is not None else self.soup.find_all(attrs=attrs)
 
-    logger.debug("Logging initialisiert")
-    return logger
+    def find_singleton(self, xmltype: Optional[Union[str, List[str]]], attrs: dict, soup= None):
+        """\
+        Sucht innerhalb der hübschen Suppe Elemente von denen es jeweils nur exakt eines geben darf.
+        """
+        elems = self.find_all(xmltype, attrs, soup)
+        assert len(elems) == 1, f"Es wurde nur ein Element zurückerwartet (habe {len(elems)=}, {xmltype!r}, {attrs=})"
+        return elems[0] if len(elems) == 1 else None
 
+    def find_singleton_by_prefixed_id(self, id_suffix: str, soup=None):
+        """\
+        Sucht innerhalb der hübschen Suppe ein Element basierend auf seiner ID, ohne Tag usw.
+        """
+        return self.find_singleton(None, attrs={"id": f"{self.prefix}{id_suffix}"}, soup=soup)
 
 def main(**kwargs):
     """\
     Die Hauptfunktion
     """
-    global log
+    global log, cache
     log = setup_logging(kwargs.get("verbose", 0))
+    cache = kwargs.get("cache", None)
     url = kwargs.get("url", None)
     assert url is not None, f"Die Einstiegs-URL kann nicht 'nichts' (None) sein."
-    search = SBASearch(url)
+    search = SBASearch(url, cache)
     for idx, detail_url in search.items():
-        search.get_details(idx, detail_url)
+        print(f"{idx}")
+        soup = SearchSoup(search.get_details_soup(idx, detail_url))
+        # DEBUGGING!
+        if idx > 10:
+            break
 
 
 if __name__ == "__main__":
     args = parse_args()
     try:
         sys.exit(main(**vars(args)))
+    except SBALogicError:
+        print("Es wurde ein Logikproblem festgestellt, welches vermutlich eine Skriptanpassung benötigt!", file=sys.stderr)
+        raise  # re-raise
+    except KeyboardInterrupt:
+        print("\nSIGINT", file=sys.stderr)
     except SystemExit:
         pass
     except ImportError:
