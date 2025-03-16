@@ -190,7 +190,7 @@ class SBASearch(object):
         self.initial_rsp = self.session.get(url)
         self.initial_soup = BeautifulSoup(self.initial_rsp.text, "html.parser")
         log.debug("%d Byte(s) mit HTTP-Code: %d", len(self.initial_rsp.text), self.initial_rsp.status_code)
-        if self.initial_rsp.status_code not in range(100,400):
+        if self.initial_rsp.status_code not in range(100, 400):
             log.critical("%d Byte(s) mit HTTP-Code: %d", len(self.initial_rsp.text), self.initial_rsp.status_code)
             raise SBARequestError(f"HTTP-Status[GET]: {self.initial_rsp.status_code} (URL: {url})")
         forms = self.initial_soup.find_all("form")
@@ -280,14 +280,18 @@ class SBASearch(object):
         cache_basepath = self.get_cache_basepath()
         cached_searchhashes = [d for d in cache_basepath.iterdir() if d.is_dir() and d.stem.startswith("OCLC_")]
         if not cached_searchhashes:
-            ... # FIXME: error
+            ...  # FIXME: error
         newest_cache_dir = sorted(cached_searchhashes, key=lambda d: d.stat().st_mtime)[-1]
         cache_file_list = sorted([cache_file for cache_file in newest_cache_dir.glob("detail_????.html")])
         assert cache_file_list, f"Es wurde kein gültiges bereits zwischengespeichertes Verzeichnis gefunden (habe versucht: {newest_cache_dir})."
-        assert cache_file_list[0].name == "detail_0000.html", f"Der erste Eintrag der Cache-List hätte 'detail_0000.html' sein sollen ({len(cache_file_list)=})."
+        assert (
+            cache_file_list[0].name == "detail_0000.html"
+        ), f"Der erste Eintrag der Cache-List hätte 'detail_0000.html' sein sollen ({len(cache_file_list)=})."
+
         def get_detail_url():
             for idx, cache_file in enumerate(cache_file_list):
                 yield idx, cache_file
+
         return get_detail_url()
 
     def items(self):
@@ -432,71 +436,122 @@ class SearchSoup(object):
         anyelem = anyelem[0]
         anyid = anyelem.get("id")
         idre = re.compile(r"^(dnn_ctr\d+?)_")
-        if match:= idre.match(anyid):
+        if match := idre.match(anyid):
             return match.group(1)
-        log.critical("Die ID (%r) stimmte nicht mit der Regex (%r) überein",anyid, idre.pattern)
+        log.critical("Die ID (%r) stimmte nicht mit der Regex (%r) überein", anyid, idre.pattern)
         log.debug("Präfix für IDs: %s", prefix)
         raise SBALogicError(f"Die ID ({anyid!r}) stimmte nicht mit der Regex ({idre.pattern!r}) überein")
-        
 
     def __parse(self):
         soup = self.soup
         prefix = self.prefix
         # Autoren/Beteiligte
-        author_links = [x.get_text() for x in self.find_all(attrs={
-            "id": re.compile(fr"^{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LVAuthorValue_LinkAuthor_[0-9]+$"),
-            "aria-describedby": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_ScreenReaderAuthorLink",
-            })]
+        author_links = [
+            x.get_text()
+            for x in self.find_all(
+                attrs={
+                    "id": re.compile(rf"^{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LVAuthorValue_LinkAuthor_[0-9]+$"),
+                    "aria-describedby": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_ScreenReaderAuthorLink",
+                }
+            )
+        ]
         # Von/Mit
-        responsibility = [x.get_text() for x in self.find_all(attrs={
-            "id": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LblStatementOfResponsibilityValue",
-            })]
+        responsibility = [
+            x.get_text()
+            for x in self.find_all(
+                attrs={
+                    "id": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LblStatementOfResponsibilityValue",
+                }
+            )
+        ]
         # Erscheinungsjahr usw.
-        publish_year = [x.get_text() for x in self.find_all(attrs={
-            "id": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LblProductionYearValue",
-            })]
+        publish_year = [
+            x.get_text()
+            for x in self.find_all(
+                attrs={
+                    "id": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LblProductionYearValue",
+                }
+            )
+        ]
         # Ort, Verlag/Herausgeber/Hersteller
-        publisher = [x.get_text() for x in self.find_all(attrs={
-            "id": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LblManufacturerValue",
-            })]
+        publisher = [
+            x.get_text()
+            for x in self.find_all(
+                attrs={
+                    "id": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LblManufacturerValue",
+                }
+            )
+        ]
         # Systematiken
-        systematics = [x.get_text() for x in self.find_all(attrs={
-            "id": re.compile(fr"^{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LVSystematicValue_LinkSystematic_[0-9]+$"),
-            "aria-describedby": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_ScreenReaderSystematicLink",
-            })]
+        systematics = [
+            x.get_text().strip()
+            for x in self.find_all(
+                attrs={
+                    "id": re.compile(rf"^{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LVSystematicValue_LinkSystematic_[0-9]+$"),
+                    "aria-describedby": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_ScreenReaderSystematicLink",
+                }
+            )
+        ]
         # Interessenkreis
-        systematics = [x.get_text() for x in self.find_all(attrs={
-            "id": re.compile(fr"^{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LVSubjectTypeValue_LinkSubjectType_[0-9]+$"),
-            "aria-describedby": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_ScreenReaderSubjectType",
-            })]
+        subject_type = [
+            x.get_text().strip()
+            for x in self.find_all(
+                attrs={
+                    "id": re.compile(rf"^{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LVSubjectTypeValue_LinkSubjectType_[0-9]+$"),
+                    "aria-describedby": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_ScreenReaderSubjectType",
+                }
+            )
+        ]
         # ISBN
-        isbn = [x.get_text() for x in self.find_all(attrs={
-            "id": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_Lbl1stIsbnValue", #FIXME/TODO: gibt es weitere?
-            })]
+        isbn = [
+            x.get_text().strip()
+            for x in self.find_all(
+                attrs={
+                    "id": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_Lbl1stIsbnValue",  # FIXME/TODO: gibt es weitere?
+                }
+            )
+        ]
         # Beschreibung
-        description = [x.get_text() for x in self.find_all(attrs={
-            "id": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LblDescriptionValue",
-            })]
+        description = [
+            x.get_text().strip()
+            for x in self.find_all(
+                attrs={
+                    "id": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LblDescriptionValue",
+                }
+            )
+        ]
         # Exzerpt
-        excerpt = [x.get_text() for x in self.find_all(attrs={
-            "id": f"{prefix}_MainView_UcDetailView_CatalogueContent",
-            })]
+        excerpt = [
+            x.get_text().strip()
+            for x in self.find_all(
+                attrs={
+                    "id": f"{prefix}_MainView_UcDetailView_CatalogueContent",
+                }
+            )
+        ]
         copies_table = self.find_all("table", {"id": f"{prefix}_MainView_UcDetailView_ucCatalogueCopyView_grdViewMediumCopies"})
         assert len(copies_table) == 1, f"Es kann nur eine Tabelle mit Exemplaren geben. Habe {len(copies_table)=}."
         if copies_table and len(copies_table) == 1:
-            copy_cols = [x.get("abbr", None) or x.get_text() for x in copies_table[0].find_all("th", attrs={"scope": "col"})]
-            assert set(copy_cols) == {"Schulbibliothek", "Standorte", "Status", "Rückgabedatum"}, f"Die Spalten stimmen nicht mit unseren Annahmen überein. Zeit das Skript anzupassen."
-            print(f"{copy_cols=}")
-
-                
-
-        print(f"{author_links=}")
-        print(f"{systematics=}")
-        print(f"{responsibility=}")
-        print(f"{isbn=}")
-        print(f"{description=}")
-        print(f"{excerpt=}")
-        print(f"{publisher=}; {publish_year=}")
+            copies_table = copies_table[0]
+            copy_cols = [x.get("abbr", None) or x.get_text() for x in copies_table.find_all("th", attrs={"scope": "col"})]
+            assert set(copy_cols) == {
+                "Schulbibliothek",
+                "Standorte",
+                "Status",
+                "Rückgabedatum",
+            }, f"Die Spalten stimmen nicht mit unseren Annahmen überein. Zeit das Skript anzupassen."
+            copies_rows = copies_table.find_all("tr", recursive=lambda tag: tag.find("td") is not None)
+            assert len(copies_rows) > 0, f"Es wird erwartet daß mindestens ein Exemplar vermerkt ist. ({len(copies_rows)=})"
+            if len(copies_rows) > 2:
+                print(f"{len(copies_rows)=}")
+                print(f"{author_links=}")
+                print(f"{systematics=}")
+                print(f"{subject_type=}")
+                print(f"{responsibility=}")
+                print(f"{isbn=}")
+                print(f"{description=}")
+                print(f"{excerpt=}")
+                print(f"{publisher=}; {publish_year=}")
 
         # div: "_MainView_UcDetailView_CatalogueCopyView" (Anzahl Exemplare in der jeweiligen Bücherei)
         #   tr -> th (Spaltentitel)
@@ -505,14 +560,14 @@ class SearchSoup(object):
         #   Anmerkung: Status ist hier bspw. "In Einarbeitung" für neue Bücherlieferungen seitens der SBA
         # soup.find_all('a', id=re.compile(r'^link'))
 
-    def find_all(self, xmltype: Optional[Union[str, List[str]]] = None, attrs: dict = {}, soup= None):
+    def find_all(self, xmltype: Optional[Union[str, List[str]]] = None, attrs: dict = {}, soup=None):
         """\
         Sucht innerhalb der hübschen Suppe Elemente.
         """
         soup = soup or self.soup
         return soup.find_all(xmltype, attrs=attrs) if xmltype is not None else self.soup.find_all(attrs=attrs)
 
-    def find_singleton(self, xmltype: Optional[Union[str, List[str]]], attrs: dict, soup= None):
+    def find_singleton(self, xmltype: Optional[Union[str, List[str]]], attrs: dict, soup=None):
         """\
         Sucht innerhalb der hübschen Suppe Elemente von denen es jeweils nur exakt eines geben darf.
         """
@@ -526,6 +581,7 @@ class SearchSoup(object):
         """
         return self.find_singleton(None, attrs={"id": f"{self.prefix}{id_suffix}"}, soup=soup)
 
+
 def main(**kwargs):
     """\
     Die Hauptfunktion
@@ -537,11 +593,10 @@ def main(**kwargs):
     assert url is not None, f"Die Einstiegs-URL kann nicht 'nichts' (None) sein."
     search = SBASearch(url, cache)
     for idx, detail_url in search.items():
-        print(f"{idx}")
         soup = SearchSoup(search.get_details_soup(idx, detail_url))
         # DEBUGGING!
-        if idx > 10:
-            break
+        # if idx > 10:
+        #    break
 
 
 if __name__ == "__main__":
