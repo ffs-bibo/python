@@ -18,7 +18,7 @@ from __future__ import (
 
 __author__ = "Oliver Schneider"
 __copyright__ = "2024, 2025 Oliver Schneider (assarbad.net), under the terms of the UNLICENSE"
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 __compatible__ = (
     (3, 12),
     (3, 13),
@@ -36,6 +36,7 @@ import sys
 import random
 import requests
 import time
+import tracemalloc
 from bs4 import BeautifulSoup
 from contextlib import suppress
 from functools import cache
@@ -126,6 +127,9 @@ def setup_logging(verbosity: int):
 
     logger.debug("Logging initialisiert")
     return logger
+
+
+class ValidationError(ValueError): ...
 
 
 class SBARequestError(RuntimeError): ...
@@ -280,6 +284,7 @@ class SBASearch(object):
         cache_basepath = self.get_cache_basepath()
         cached_searchhashes = [d for d in cache_basepath.iterdir() if d.is_dir() and d.stem.startswith("OCLC_")]
         if not cached_searchhashes:
+            raise SBALogicError(f"Im Cache-Pfad ({self.get_cache_basepath()}) wurde kein Verzeichnis mit dem Namen eines Suchhashes gefunden.")
             ...  # FIXME: error
         newest_cache_dir = sorted(cached_searchhashes, key=lambda d: d.stat().st_mtime)[-1]
         cache_file_list = sorted([cache_file for cache_file in newest_cache_dir.glob("detail_????.html")])
@@ -423,16 +428,64 @@ class SBASearch(object):
         return BeautifulSoup(details, "html.parser")
 
 
-class SearchSoup(object):
+class SBABookDetails(object):
+    _known_attributes = {
+        "authors": lambda x: isinstance(x, tuple),  # 0..∞
+        "title": lambda x: isinstance(x, str) and x,  # 1
+        "excerpt": lambda x: x is None or (isinstance(x, str) and x),  # kann leer sein!
+        "responsibility": lambda x: isinstance(x, tuple),  # 0..∞?
+        "publish_year": lambda x: isinstance(x, str) and x,  # 1
+        "publisher": lambda x: isinstance(x, tuple),  # 0..1
+        "systematics": lambda x: isinstance(x, tuple) and len(x) > 0 and all(isinstance(e, str) for e in x),  # 1..∞?
+        "subject_type": lambda x: isinstance(x, tuple) and all(isinstance(e, str) for e in x),  # 0..∞?
+        "isbn": lambda x: isinstance(x, tuple) and len(x) in {0, 1},  # 0..1
+        "description": lambda x: isinstance(x, str) and x,  # 1
+        "match_entry": lambda x: isinstance(x, int) or x is None,
+        "match_index": lambda x: isinstance(x, int) or x is None,
+        "match_total": lambda x: isinstance(x, int) or x is None,
+        "number_copies": lambda x: isinstance(x, int) and x > 0,
+    }
+
     def __init__(self, soup):
         self.soup = soup
+        self._attributes = {}
+        self._known_attributes = SBABookDetails._known_attributes
+        self.valid_copy_cols = {
+            (
+                "Schulbibliothek",
+                "Standorte",
+                "Status",
+                "Rückgabedatum",
+            ),
+            (
+                # Sonderfall: https://sbakatalog.stadtbuecherei.frankfurt.de/Mediensuche/Einfache-Suche?searchhash=OCLC_a15e4d46661d4e3fdcbb4e23f983fb9a03fa8e9f&top=y&page=157&detail=1562&zwst=Friedrich-Fr%c3%b6bel
+                "Aktion",
+                "Schulbibliothek",
+                "Standorte",
+                "Status",
+                "Rückgabedatum",
+            ),
+        }
         self.__parse()
+
+    @cache
+    def __getattr__(self, name):
+        if name not in self._known_attributes:
+            raise AttributeError(f"'{self.__class__.__name__}' object has no known attribute '{name}'")
+        if name in self._attributes:
+            return self._attributes[name]
+        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+
+    @cache
+    def __dir__(self):
+        return list(self._known_attributes.keys()) + super().__dir__()
 
     @property
     @cache
     def prefix(self):
         anyelem = self.soup.find_all("div", {"id": lambda x: x and x.endswith("_MainView_UcDetailView_CatalogueDetailView")})
-        assert len(anyelem) == 1, f"Es wird erwartet daß nur ein Element mit der gesuchten ID existiert ({anyelem=!r})"
+        if len(anyelem) != 1:
+            raise ValidationError(f"Es wird erwartet daß nur ein Element mit der gesuchten ID existiert ({anyelem=!r})")
         anyelem = anyelem[0]
         anyid = anyelem.get("id")
         idre = re.compile(r"^(dnn_ctr\d+?)_")
@@ -445,8 +498,14 @@ class SearchSoup(object):
     def __parse(self):
         soup = self.soup
         prefix = self.prefix
-        # Autoren/Beteiligte
-        author_links = [
+        # Vorbelegungen für Werte die mglw. nicht vorhanden sind
+        self._attributes["match_entry"] = None
+        self._attributes["match_index"] = None
+        self._attributes["match_total"] = None
+        self._attributes["number_copies"] = 0
+        self._attributes["excerpt"] = None
+        # Autoren/Beteiligte (0..∞)
+        self._attributes["authors"] = tuple(
             x.get_text()
             for x in self.find_all(
                 attrs={
@@ -454,36 +513,56 @@ class SearchSoup(object):
                     "aria-describedby": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_ScreenReaderAuthorLink",
                 }
             )
-        ]
-        # Von/Mit
-        responsibility = [
+            if x.get_text().strip()
+        )
+        # Buchtitel (1)
+        title = [x.get("content").strip() for x in self.find_all(xmltype="meta", attrs={"property": f"og:title", "content": lambda x: x})]
+        if len(title) != 1:
+            raise ValidationError(f"Nur ein Buchtitel wurde erwartet (habe {len(title)=})!")
+        if not title:
+            raise ValidationError(f"Buchtitel darf nicht leer sein ({title=!r})!")
+        self._attributes["title"] = title[0]
+        # Exzerpt/Inhaltsangabe (kann leer sein!)
+        excerpt = tuple(x.get("content") for x in self.find_all(attrs={"property": f"og:description", "content": lambda x: x}))
+        if excerpt:
+            if len(excerpt) != 1:
+                raise ValidationError(f"Nur eine Inhaltsangabe wurde erwartet (habe {len(excerpt)=})!")
+            self._attributes["excerpt"] = excerpt[0]
+        # Von/Mit (0..∞?)
+        self._attributes["responsibility"] = tuple(
             x.get_text()
             for x in self.find_all(
                 attrs={
                     "id": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LblStatementOfResponsibilityValue",
                 }
             )
-        ]
-        # Erscheinungsjahr usw.
-        publish_year = [
+            if x.get_text().strip()
+        )
+        # Erscheinungsjahr (1)
+        publish_year = tuple(
             x.get_text()
             for x in self.find_all(
                 attrs={
                     "id": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LblProductionYearValue",
                 }
             )
-        ]
-        # Ort, Verlag/Herausgeber/Hersteller
-        publisher = [
+            if x.get_text().strip()
+        )
+        if len(publish_year) != 1:
+            raise ValidationError(f"Es wurde ein Erscheinungsjahr erwartet (habe {len(publish_year)=}).")
+        self._attributes["publish_year"] = publish_year[0]
+        # Ort, Verlag/Herausgeber/Hersteller (0..1)
+        self._attributes["publisher"] = tuple(
             x.get_text()
             for x in self.find_all(
                 attrs={
                     "id": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LblManufacturerValue",
                 }
             )
-        ]
-        # Systematiken
-        systematics = [
+            if x.get_text().strip()
+        )
+        # Systematiken (1..∞?)
+        systematics = tuple(
             x.get_text().strip()
             for x in self.find_all(
                 attrs={
@@ -491,9 +570,13 @@ class SearchSoup(object):
                     "aria-describedby": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_ScreenReaderSystematicLink",
                 }
             )
-        ]
-        # Interessenkreis
-        subject_type = [
+            if x.get_text().strip()
+        )
+        if not systematics:
+            raise ValidationError(f"Es wurde mindestens eine Systematik erwartet (habe {len(systematics)=}).")
+        self._attributes["systematics"] = systematics
+        # Interessenkreis (0..∞?)
+        self._attributes["subject_type"] = tuple(
             x.get_text().strip()
             for x in self.find_all(
                 attrs={
@@ -501,64 +584,80 @@ class SearchSoup(object):
                     "aria-describedby": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_ScreenReaderSubjectType",
                 }
             )
-        ]
-        # ISBN
-        isbn = [
+            if x.get_text().strip()
+        )
+        # ISBN (0..1)
+        self._attributes["isbn"] = tuple(
             x.get_text().strip()
             for x in self.find_all(
                 attrs={
                     "id": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_Lbl1stIsbnValue",  # FIXME/TODO: gibt es weitere?
                 }
             )
-        ]
-        # Beschreibung
-        description = [
+            if x.get_text().strip()
+        )
+        # Beschreibung (1)
+        description = tuple(
             x.get_text().strip()
             for x in self.find_all(
                 attrs={
                     "id": f"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LblDescriptionValue",
                 }
             )
-        ]
-        # Exzerpt
-        excerpt = [
+            if x.get_text().strip()
+        )
+        if len(description) != 1:
+            raise ValidationError(f"Es wurde eine Beschreibung erwartet (habe {len(description)=}).")
+        self._attributes["description"] = description[0]
+        # Treffernummer ermitteln
+        match_number = [
             x.get_text().strip()
             for x in self.find_all(
                 attrs={
-                    "id": f"{prefix}_MainView_UcDetailView_CatalogueContent",
+                    "id": f"{prefix}_MainView_UcDetailView_LblDetailNavigator",
                 }
             )
         ]
+        if match_number:
+            assert len(match_number) == 1, f"Es darf nur einen Treffer in der Detailanzeige geben ({len(match_number)=})."  # nicht fatal, daher nur assert
+            match_number = match_number[0]
+            if m := re.match(r"^(\d+?)\s+?von\s+?(\d+)$", match_number):
+                match_number = int(m.group(1), 10)
+                match_total = int(m.group(2), 10)
+                match_index = match_number - 1
+                self._attributes["match_entry"] = match_number
+                self._attributes["match_index"] = match_index
+                self._attributes["match_total"] = match_total
+        # Tabelle mit Exemplaren in der jeweiligen Bibliothek
         copies_table = self.find_all("table", {"id": f"{prefix}_MainView_UcDetailView_ucCatalogueCopyView_grdViewMediumCopies"})
-        assert len(copies_table) == 1, f"Es kann nur eine Tabelle mit Exemplaren geben. Habe {len(copies_table)=}."
+        if len(copies_table) != 1:
+            raise ValidationError(f"Es kann nur eine Tabelle mit Exemplaren geben. Habe {len(copies_table)=}, {match_index=}.")
         if copies_table and len(copies_table) == 1:
             copies_table = copies_table[0]
-            copy_cols = [x.get("abbr", None) or x.get_text() for x in copies_table.find_all("th", attrs={"scope": "col"})]
-            assert set(copy_cols) == {
-                "Schulbibliothek",
-                "Standorte",
-                "Status",
-                "Rückgabedatum",
-            }, f"Die Spalten stimmen nicht mit unseren Annahmen überein. Zeit das Skript anzupassen."
+            copy_cols = tuple([x.get("abbr", None) or x.get_text() for x in copies_table.find_all("th", attrs={"scope": "col"})])
+            if copy_cols not in self.valid_copy_cols:
+                raise ValidationError(
+                    f"Die Spalten stimmen nicht mit unseren Annahmen überein. Zeit das Skript anzupassen ({title=}, {match_index=}, {set(copy_cols)=!r})."
+                )
             copies_rows = copies_table.find_all("tr", recursive=lambda tag: tag.find("td") is not None)
-            assert len(copies_rows) > 0, f"Es wird erwartet daß mindestens ein Exemplar vermerkt ist. ({len(copies_rows)=})"
-            if len(copies_rows) > 2:
-                print(f"{len(copies_rows)=}")
-                print(f"{author_links=}")
-                print(f"{systematics=}")
-                print(f"{subject_type=}")
-                print(f"{responsibility=}")
-                print(f"{isbn=}")
-                print(f"{description=}")
-                print(f"{excerpt=}")
-                print(f"{publisher=}; {publish_year=}")
-
+            if not len(copies_rows) > 0:
+                raise ValidationError(f"Es wird erwartet daß mindestens ein Exemplar vermerkt ist. ({len(copies_rows)=}, {match_index=})")
+            self._attributes["number_copies"] = len(copies_rows)
+            self.copies_rows = copies_rows  # verzögerte Abarbeitung im Nachgang
+        # Validiere alle bisher belegten Attribute
+        for name, validator in self._known_attributes.items():
+            assert callable(validator), f"Brauche einen aufrufbaren Validator, habe {validator!r}."
+            if name not in self._attributes:
+                raise ValidationError(f"Nach dem Parsen hätten alle Attribute belegt sein sollen, '{name}' ist es nicht; {self._attributes=!r}.")
+            if not validator(self._attributes[name]):
+                raise ValidationError(f"Die Validierung für das Attribut '{name}' schlug fehl: {self._attributes[name]=!r}")
+        self.soup = None
+        delattr(self, "soup")
         # div: "_MainView_UcDetailView_CatalogueCopyView" (Anzahl Exemplare in der jeweiligen Bücherei)
         #   tr -> th (Spaltentitel)
         #   tr -> td (eigentliche Zeilen)
         #   <td><span class="oclc-module-view-small oclc-module-label">Standorte:</span><span>1.2 Zusa / Bilderbuch</span></td>
         #   Anmerkung: Status ist hier bspw. "In Einarbeitung" für neue Bücherlieferungen seitens der SBA
-        # soup.find_all('a', id=re.compile(r'^link'))
 
     def find_all(self, xmltype: Optional[Union[str, List[str]]] = None, attrs: dict = {}, soup=None):
         """\
@@ -586,17 +685,25 @@ def main(**kwargs):
     """\
     Die Hauptfunktion
     """
+    # tracemalloc.start()
     global log, cache
     log = setup_logging(kwargs.get("verbose", 0))
     cache = kwargs.get("cache", None)
     url = kwargs.get("url", None)
     assert url is not None, f"Die Einstiegs-URL kann nicht 'nichts' (None) sein."
     search = SBASearch(url, cache)
+    book_details = []
     for idx, detail_url in search.items():
-        soup = SearchSoup(search.get_details_soup(idx, detail_url))
+        book = SBABookDetails(search.get_details_soup(idx, detail_url))
+        book_details.append(book)
         # DEBUGGING!
         # if idx > 10:
-        #    break
+        #     break
+    # snapshot = tracemalloc.take_snapshot()
+    # top_stats = snapshot.statistics("lineno")
+    # print("[ Top 10 memory-consuming lines ]")
+    # for stat in top_stats[:10]:
+    #     print(stat)
 
 
 if __name__ == "__main__":
