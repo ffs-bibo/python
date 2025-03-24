@@ -18,7 +18,7 @@ from __future__ import (
 
 __author__ = "Oliver Schneider"
 __copyright__ = "2024, 2025 Oliver Schneider (assarbad.net), under the terms of the UNLICENSE"
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 __compatible__ = (
     (3, 12),
     (3, 13),
@@ -30,13 +30,13 @@ __doc__ = """
 """
 import argparse  # noqa: F401
 import logging
+import json
 import os  # noqa: F401
 import re
 import sys
 import random
 import requests
 import time
-import tracemalloc
 from bs4 import BeautifulSoup
 from contextlib import suppress
 from functools import cache
@@ -80,6 +80,14 @@ def parse_args():
         metavar="URL",
         help="URL zur Schule beim SBA-'Katalog'",
         default="https://sbakatalog.stadtbuecherei.frankfurt.de/A-F/Friedrich-Fr%C3%B6bel-Schule",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        dest="outfile",
+        metavar="JSONFILE",
+        help="Pfad zu einer JSON-Datei in welche die Ausgabe geschrieben werden soll",
+        default=Path(__file__).resolve().parent / "output.json",
     )
     parser.add_argument(
         "-v",
@@ -285,7 +293,6 @@ class SBASearch(object):
         cached_searchhashes = [d for d in cache_basepath.iterdir() if d.is_dir() and d.stem.startswith("OCLC_")]
         if not cached_searchhashes:
             raise SBALogicError(f"Im Cache-Pfad ({self.get_cache_basepath()}) wurde kein Verzeichnis mit dem Namen eines Suchhashes gefunden.")
-            ...  # FIXME: error
         newest_cache_dir = sorted(cached_searchhashes, key=lambda d: d.stat().st_mtime)[-1]
         cache_file_list = sorted([cache_file for cache_file in newest_cache_dir.glob("detail_????.html")])
         assert cache_file_list, f"Es wurde kein gültiges bereits zwischengespeichertes Verzeichnis gefunden (habe versucht: {newest_cache_dir})."
@@ -443,7 +450,7 @@ class SBABookDetails(object):
         "match_entry": lambda x: isinstance(x, int) or x is None,
         "match_index": lambda x: isinstance(x, int) or x is None,
         "match_total": lambda x: isinstance(x, int) or x is None,
-        "number_copies": lambda x: isinstance(x, int) and x > 0,
+        "copies": lambda x: isinstance(x, list) and len(x) > 0 and all(isinstance(e, dict) for e in x),  # 1..∞?
     }
 
     def __init__(self, soup):
@@ -634,16 +641,24 @@ class SBABookDetails(object):
             raise ValidationError(f"Es kann nur eine Tabelle mit Exemplaren geben. Habe {len(copies_table)=}, {match_index=}.")
         if copies_table and len(copies_table) == 1:
             copies_table = copies_table[0]
+            # Anmerkung: Status ist hier bspw. "In Einarbeitung" für neue Bücherlieferungen seitens der SBA
             copy_cols = tuple([x.get("abbr", None) or x.get_text() for x in copies_table.find_all("th", attrs={"scope": "col"})])
             if copy_cols not in self.valid_copy_cols:
                 raise ValidationError(
                     f"Die Spalten stimmen nicht mit unseren Annahmen überein. Zeit das Skript anzupassen ({title=}, {match_index=}, {set(copy_cols)=!r})."
                 )
-            copies_rows = copies_table.find_all("tr", recursive=lambda tag: tag.find("td") is not None)
-            if not len(copies_rows) > 0:
-                raise ValidationError(f"Es wird erwartet daß mindestens ein Exemplar vermerkt ist. ({len(copies_rows)=}, {match_index=})")
-            self._attributes["number_copies"] = len(copies_rows)
-            self.copies_rows = copies_rows  # verzögerte Abarbeitung im Nachgang
+            for elem in soup.select(f"table#{prefix}_MainView_UcDetailView_ucCatalogueCopyView_grdViewMediumCopies tr:has(td) td span.oclc-module-label"):
+                elem.decompose()
+            copies_rows = soup.select(f"table#{prefix}_MainView_UcDetailView_ucCatalogueCopyView_grdViewMediumCopies tr:has(td)")
+            copies = []
+            for row in copies_rows:
+                col_contents = [x.get_text().replace("\n", " ").strip() for x in row.select("tr td")]
+                if len(col_contents) != len(copy_cols):
+                    raise ValidationError(
+                        f"Es wurde erwartet daß die Anzahl Spalten im Tabellenkopf mit der Anzahl Spalten in den Zeilen übereinstimmt ({len(copies_cells)=} != {len(copy_cols)=})."
+                    )
+                copies.append(dict(zip(copy_cols, col_contents)))
+            self._attributes["copies"] = copies
         # Validiere alle bisher belegten Attribute
         for name, validator in self._known_attributes.items():
             assert callable(validator), f"Brauche einen aufrufbaren Validator, habe {validator!r}."
@@ -653,11 +668,6 @@ class SBABookDetails(object):
                 raise ValidationError(f"Die Validierung für das Attribut '{name}' schlug fehl: {self._attributes[name]=!r}")
         self.soup = None
         delattr(self, "soup")
-        # div: "_MainView_UcDetailView_CatalogueCopyView" (Anzahl Exemplare in der jeweiligen Bücherei)
-        #   tr -> th (Spaltentitel)
-        #   tr -> td (eigentliche Zeilen)
-        #   <td><span class="oclc-module-view-small oclc-module-label">Standorte:</span><span>1.2 Zusa / Bilderbuch</span></td>
-        #   Anmerkung: Status ist hier bspw. "In Einarbeitung" für neue Bücherlieferungen seitens der SBA
 
     def find_all(self, xmltype: Optional[Union[str, List[str]]] = None, attrs: dict = {}, soup=None):
         """\
@@ -680,30 +690,33 @@ class SBABookDetails(object):
         """
         return self.find_singleton(None, attrs={"id": f"{self.prefix}{id_suffix}"}, soup=soup)
 
+    @cache
+    def to_json_ready_dict(self):
+        json_ready_dict = {}
+        for key in self._known_attributes.keys():
+            if not hasattr(self, key):
+                raise ValidationError(f"Erwartetes Attribut '{key}' existiert nicht.")
+            json_ready_dict[key] = getattr(self, key)
+        return json_ready_dict
+
 
 def main(**kwargs):
     """\
     Die Hauptfunktion
     """
-    # tracemalloc.start()
     global log, cache
     log = setup_logging(kwargs.get("verbose", 0))
     cache = kwargs.get("cache", None)
+    outfile = kwargs.get("outfile", Path(__file__).resolve().parent / "output.json")
     url = kwargs.get("url", None)
     assert url is not None, f"Die Einstiegs-URL kann nicht 'nichts' (None) sein."
     search = SBASearch(url, cache)
     book_details = []
     for idx, detail_url in search.items():
         book = SBABookDetails(search.get_details_soup(idx, detail_url))
-        book_details.append(book)
-        # DEBUGGING!
-        # if idx > 10:
-        #     break
-    # snapshot = tracemalloc.take_snapshot()
-    # top_stats = snapshot.statistics("lineno")
-    # print("[ Top 10 memory-consuming lines ]")
-    # for stat in top_stats[:10]:
-    #     print(stat)
+        book_details.append(book.to_json_ready_dict())
+    with open(outfile, "w") as json_file:
+        json.dump(book_details, json_file, allow_nan=False, ensure_ascii=False, sort_keys=True, indent=4)
 
 
 if __name__ == "__main__":
