@@ -1,6 +1,12 @@
-#!/usr/bin/env python
+#!/usr/bin/env -S uv run
 # -*- coding: utf-8 -*-
 # vim: set autoindent smartindent softtabstop=4 tabstop=4 shiftwidth=4 expandtab:
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "isbnlib>=3.10",
+# ]
+# ///
 from __future__ import (
     print_function,
     with_statement,
@@ -10,17 +16,16 @@ from __future__ import (
 )
 
 __author__ = "Oliver Schneider"
-__copyright__ = "2024 Oliver Schneider (assarbad.net), under the terms of the UNLICENSE"
+__copyright__ = "2024, 2025 Oliver Schneider (assarbad.net), under the terms of the UNLICENSE"
 __version__ = "0.1.0"
 __compatible__ = (
-    (3, 10),
-    (3, 11),
     (3, 12),
+    (3, 13),
 )
 __doc__ = """
-=========
- PROGRAM
-=========
+======================== 
+ Bestandslistenabgleich
+========================
 """
 import argparse  # noqa: F401
 import csv
