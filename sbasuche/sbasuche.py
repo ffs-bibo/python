@@ -6,6 +6,7 @@
 # dependencies = [
 #     "beautifulsoup4>=4.13",
 #     "requests>=2.32",
+#     "isbnlib>=3.10",
 # ]
 # ///
 from __future__ import (
@@ -40,6 +41,7 @@ import time
 from bs4 import BeautifulSoup
 from contextlib import suppress
 from functools import cache
+from isbnlib import is_isbn13, is_isbn10, to_isbn13, canonical  # editions, meta, goom
 from pathlib import Path
 from typing import Union, List, Optional
 from urllib.parse import urlparse
@@ -57,7 +59,7 @@ def parse_args():
     """
     from argparse import ArgumentParser
 
-    parser = ArgumentParser(description="PROGRAM")
+    parser = ArgumentParser(description=Path(__file__).name)
     parser.add_argument(
         "--nologo",
         action="store_const",
@@ -594,7 +596,7 @@ class SBABookDetails(object):
             if x.get_text().strip()
         )
         # ISBN (0..1)
-        self._attributes["isbn"] = tuple(
+        isbn = tuple(
             x.get_text().strip()
             for x in self.find_all(
                 attrs={
@@ -603,6 +605,15 @@ class SBABookDetails(object):
             )
             if x.get_text().strip()
         )
+        if isbn:
+            isbn = isbn[0]
+            if is_isbn10(isbn):
+                isbn = (canonical(to_isbn13(isbn)),)
+            elif is_isbn13(isbn):
+                isbn = (canonical(to_isbn13(isbn)),)
+            else:
+                isbn = (f"!{isbn}",)
+        self._attributes["isbn"] = isbn
         # Beschreibung (1)
         description = tuple(
             x.get_text().strip()

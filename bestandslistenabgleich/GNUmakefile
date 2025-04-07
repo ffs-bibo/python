@@ -1,22 +1,14 @@
 PYSCRIPTS:=bestandslistenabgleich.py
 
-abgleich: bestandslistenabgleich.py data/Bestandsliste_von_SBA.csv data/Bestandsliste_von_uns.csv
-	python3 $(firstword $^) $(filter-out $(firstword $^),$^)
+abgleich: bestandslistenabgleich.py data/Bestandsliste_von_uns.csv
+	./$(firstword $^) -v $(filter-out $(firstword $^),$^)
 
 lint: $(PYSCRIPTS)
-	flake8 $^
+	ruff check $^
 
-pretty: black
+pretty: $(PYSCRIPTS)
+	ruff format $^
 
-prerequisites: requirements.txt install-python-prerequisites.sh
-	./install-python-prerequisites.sh
+all: lint pretty
 
-black: $(PYSCRIPTS)
-	$@ $^
-
-vulture: $(PYSCRIPTS)
-	$@ $^
-
-all: black lint vulture
-
-.PHONY: abgleich all black lint pretty prerequisites vulture
+.PHONY: abgleich all lint pretty

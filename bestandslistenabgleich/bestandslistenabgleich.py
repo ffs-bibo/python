@@ -1,6 +1,13 @@
-#!/usr/bin/env python
+#!/usr/bin/env -S uv run
 # -*- coding: utf-8 -*-
 # vim: set autoindent smartindent softtabstop=4 tabstop=4 shiftwidth=4 expandtab:
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "isbnlib>=3.10",
+#     "RapidFuzz>=3.13",
+# ]
+# ///
 from __future__ import (
     print_function,
     with_statement,
@@ -10,38 +17,43 @@ from __future__ import (
 )
 
 __author__ = "Oliver Schneider"
-__copyright__ = "2024 Oliver Schneider (assarbad.net), under the terms of the UNLICENSE"
-__version__ = "0.1.0"
+__copyright__ = "2024, 2025 Oliver Schneider (assarbad.net), under the terms of the UNLICENSE"
+__version__ = "0.1.1"
 __compatible__ = (
-    (3, 10),
-    (3, 11),
     (3, 12),
+    (3, 13),
 )
 __doc__ = """
-=========
- PROGRAM
-=========
+======================== 
+ Bestandslistenabgleich
+========================
 """
 import argparse  # noqa: F401
 import csv
+import json
+import logging
 import os  # noqa: F401
 import sys
+from collections.abc import Iterable
 from isbnlib import is_isbn13, is_isbn10, to_isbn13, canonical  # editions, meta, goom
 from pathlib import Path
+from rapidfuzz import fuzz
 
 # Checking for compatibility with Python version
 if not sys.version_info[:2] in __compatible__:
     sys.exit(
-        "This script is only compatible with the following Python versions: %s."
-        % (", ".join(["%d.%d" % (z[0], z[1]) for z in __compatible__]))
+        "Dieses Skript ist nur mit folgenden Pythonversionen kompatibel: %s" % (", ".join(["%d.%d" % (z[0], z[1]) for z in __compatible__]))
     )  # pragma: no cover
+
+
+class ValidationError(ValueError): ...
 
 
 def parse_args():
     """ """
     from argparse import ArgumentParser
 
-    parser = ArgumentParser(description="PROGRAM")
+    parser = ArgumentParser(description=Path(__file__).name)
     parser.add_argument(
         "--nologo",
         action="store_const",
@@ -58,11 +70,14 @@ def parse_args():
         default="https://sbakatalog.stadtbuecherei.frankfurt.de/A-F/Friedrich-Fr%C3%B6bel-Schule",
     )
     parser.add_argument(
+        "-s",
+        "--sba",
         action="store",
         dest="sbalist",
         metavar="SBALISTE",
         type=Path,
-        help="Pfad zur CSV-Liste die aus dem Excel-Sheet der SBA erstellt wurde.",
+        help="Pfad zur SBA-Liste im JSON-Format, welche mit der 'sbasuche.py' erstellt wurde.",
+        default=Path(__file__).parent.parent / "sbasuche/output.json",
     )
     parser.add_argument(
         action="store",
@@ -71,74 +86,188 @@ def parse_args():
         type=Path,
         help="Pfad zur CSV-Liste die aus unserem Excel-Sheet erstellt wurde.",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        help="Setzen der Ausführlichkeit der Ausgaben (verbosity); kann mehrfach angegeben werden",
+        default=0,
+    )
     return parser.parse_args()
 
 
-def read_sba_format(inp):
-    # "Systematik","Kurzanzeige","JahrAufl.","VerlagOrt","ISBN"
-    reader = csv.reader(inp, dialect="excel")
-    count = 0
-    systematik = set()
-    isbn_set = set()
-    noisbn_list = []
-    strange_isbns = []
-    invalid_isbns = []
-    for row in reader:
-        if count > 0:
-            systematik.add(row[0])
-            if row[4].strip():
-                isbn = canonical(row[4] if is_isbn13(row[4]) else to_isbn13(row[4]))
-                if isbn:
-                    print(f"{isbn}")
-                    isbn_set.add(isbn)
-                    if not isbn.startswith("9783"):
-                        strange_isbns.append(isbn)
-                else:
-                    invalid_isbns.append(row)
-            else:
-                print(f"{row[1]}")
-                noisbn_list.append(row[1:3])
-        count += 1
-    print(repr(systematik))
-    print(f"{len(systematik)=}")
-    print(f"{len(isbn_set)=}")
-    print(f"{len(strange_isbns)=}")
-    if len(strange_isbns) < 100:
-        for entry in strange_isbns:
-            print(f"Seltsame ISBN: {entry}")
-            #print(f"{entry}")
-    print(f"{len(noisbn_list)=}")
-    if len(noisbn_list) < 100:
-        for entry in noisbn_list:
-            print(f"KEINE ISBN: {entry}")
-            # print(f"{entry[0]}")
-    if len(invalid_isbns) < 100:
-        for row in invalid_isbns:
-            print(f"Ungültige ISBN?: {row=}")
+def setup_logging(verbosity: int):
+    """\
+    Initialisierung des Loggens in eine Datei und auf sys.stderr
+    """
+    # Ausführlichkeit wird als globale Variable verfügbar gemacht
+    global verbose
+    verbose = verbosity
+
+    script_filename = Path(__file__).resolve()
+    log_filename = f"{script_filename.stem}.log"
+    log_filepath = script_filename.parent / log_filename
+
+    logger = logging.getLogger(str(script_filename))
+    logger.setLevel(logging.DEBUG)
+
+    conlog = logging.StreamHandler(sys.stderr)
+    filelog = logging.FileHandler(log_filepath)
+
+    conloglvl = logging.WARNING
+    if verbosity > 1:
+        conloglvl = logging.DEBUG
+    elif verbosity > 0:
+        conloglvl = logging.INFO
+    conlog.setLevel(conloglvl)
+    filelog.setLevel(logging.DEBUG)
+
+    confmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S")
+    filefmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%dT%H:%M:%S")
+    conlog.setFormatter(confmt)
+    filelog.setFormatter(filefmt)
+
+    logger.addHandler(conlog)
+    logger.addHandler(filelog)
+
+    logger.debug("Logging initialisiert")
+    return logger
 
 
 def read_own_format(inp):
     # Sign,atur,Buchtitel,Verfasser,Zugang,,,Thema
     reader = csv.reader(inp, dialect="excel")
     count = 0
-    systematik = set()
+    kartei = {}  # Karteinummer vorhanden und einmalig vorhanden
+    waisen = []  # Keine Karteinummer
+    duplikate = []  # Karteinummer gedoppelt
     for row in reader:
         if count > 0:
-            systematik.add(" ".join(row[0:2]))
+            buchtitel, verfasser, karteinummer = row[2], row[3], row[4]
+            if karteinummer in {"?", ""}:
+                log.debug(f"Ignoriere temporär ungültige Karteinummer: '{karteinummer}'.")
+                waisen.append(
+                    (
+                        buchtitel,
+                        verfasser,
+                        karteinummer,
+                    )
+                )
+            elif karteinummer in kartei:
+                log.warning(
+                    "Karteinummer %s taucht mehrfach in der Liste auf! [%s] vs. [%s]",
+                    karteinummer,
+                    repr(kartei[karteinummer]),
+                    repr(
+                        (
+                            buchtitel,
+                            verfasser,
+                            karteinummer,
+                        )
+                    ),
+                )
+                duplikate.append(
+                    (
+                        buchtitel,
+                        verfasser,
+                        karteinummer,
+                    )
+                )
+            else:
+                kartei[karteinummer] = (
+                    buchtitel,
+                    verfasser,
+                    karteinummer,
+                )
         count += 1
-    print(repr(systematik))
-    print(f"{len(systematik)=}")
+    return kartei, waisen, duplikate
 
+
+def abgleich_einzel_exemplare(katalog, kartei):
+    global zugeordnete_karteinummern
+    # Diese Fälle sind am einfachsten. Wir haben exakt ein Exemplar, welches wir auch
+    einzel_exemplare = [x for x in katalog if len(x["copies"]) == 1]
+    print(f"{len(einzel_exemplare)=}")
+    # print(f"{einzel_exemplare[0]!r}")
+    count = 0
+    exakte_treffer = {}
+    top_treffer = {}
+    gute_treffer = {}
+    akzeptable_treffer = {}
+    for buch in einzel_exemplare:
+        highest_ratio = -1
+        treffer = {}
+        for karteinummer, (buchtitel, verfasser, _) in kartei.items():
+            ratio = fuzz.token_set_ratio(buch["title"], buchtitel)
+            if ratio > 80 and ratio >= highest_ratio:
+                if ratio > highest_ratio:
+                    treffer = {}
+                highest_ratio = ratio
+                treffer[karteinummer] = (highest_ratio, buchtitel, buch,)
+        if treffer:
+            if len(treffer) > 1:
+                log.info("MEHRERE BEST-TREFFER: %d", len(treffer))
+                for karteinummer, (highest_ratio, buchtitel, buch) in treffer.items():
+                    log.info("[%s] '%s' (%2.2f) -> '%s'", karteinummer, buchtitel, highest_ratio, buch["title"])
+                continue
+            for karteinummer, (highest_ratio, buchtitel, buch) in treffer.items():
+                if highest_ratio == 100:
+                    exakte_treffer[karteinummer] = (
+                        highest_ratio,
+                        buchtitel,
+                        buch,
+                    )
+                    del kartei[karteinummer]
+                elif highest_ratio > 99:
+                    top_treffer[karteinummer] = (
+                        highest_ratio,
+                        buchtitel,
+                        buch,
+                    )
+                elif highest_ratio >= 90:
+                    gute_treffer[karteinummer] = (
+                        highest_ratio,
+                        buchtitel,
+                        buch,
+                    )
+                elif highest_ratio >= 80:
+                    akzeptable_treffer[karteinummer] = (
+                        highest_ratio,
+                        buchtitel,
+                        buch,
+                    )
+        count += 1
+    print(f"{len(exakte_treffer)=}")
+    print(f"{len(top_treffer)=}")
+    print(f"{len(gute_treffer)=}")
+    print(f"{len(akzeptable_treffer)=}")
+    top_ratio = 100 * ((len(exakte_treffer) + len(top_treffer)) / len(einzel_exemplare))
+    print(f"{top_ratio:2.2f} %")
+    neuer_katalog = []
 
 def main(**kwargs):
     """ """
-    print(repr(kwargs))
+    global log, cache
+    log = setup_logging(kwargs.get("verbose", 0))
     sbalist = kwargs.get("sbalist", None)
     ownlist = kwargs.get("ownlist", None)
-    with open(sbalist, "r") as sbacsv:
-        read_sba_format(sbacsv)
-    # with open(ownlist, "r") as owncsv:
-    #     read_own_format(owncsv)
+    katalog, kartei, waisen, duplikate = None, None, None, None
+    with open(sbalist, "r") as json_file:
+        katalog = json.load(json_file)
+    print(f"{len(katalog)=}")
+    with open(ownlist, "r") as owncsv:
+        kartei, waisen, duplikate = read_own_format(owncsv)
+    if katalog is None or not isinstance(katalog, Iterable):
+        raise ValidationError("'katalog' (gelesen aus der JSON von sbasuche.py) ist ungültig.")
+    if kartei is None or not isinstance(kartei, Iterable):
+        raise ValidationError("'kartei' (gelesen aus unserer CSV-Liste) ist ungültig.")
+    if waisen:
+        log.warning("Habe %d verwaiste Einträge", 0 if waisen is None else len(waisen))
+    if duplikate:
+        log.warning("Habe %d Duplikat(e)", 0 if duplikate is None else len(duplikate))
+    global zugeordnete_karteinummern
+    zugeordnete_karteinummern = {}
+    abgleich_einzel_exemplare(katalog, kartei)
     return 0
 
 
