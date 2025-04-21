@@ -18,7 +18,7 @@ from __future__ import (
 
 __author__ = "Oliver Schneider"
 __copyright__ = "2024, 2025 Oliver Schneider (assarbad.net), under the terms of the UNLICENSE"
-__version__ = "0.1.1"
+__version__ = "0.1.4"
 __compatible__ = (
     (3, 12),
     (3, 13),
@@ -33,11 +33,14 @@ import csv
 import json
 import logging
 import os  # noqa: F401
+import re
 import sys
 from collections.abc import Iterable
+from contextlib import suppress
+from functools import cache
 from isbnlib import is_isbn13, is_isbn10, to_isbn13, canonical  # editions, meta, goom
 from pathlib import Path
-from rapidfuzz import fuzz
+from rapidfuzz import fuzz, process, utils
 
 # Checking for compatibility with Python version
 if not sys.version_info[:2] in __compatible__:
@@ -134,16 +137,54 @@ def setup_logging(verbosity: int):
     return logger
 
 
+def homoglyph_sanitize(inp):
+    homoglyphs_mapping = {
+        "\u2013": "-",  # En dash to hyphen
+        "\u2014": "-",  # Em dash to hyphen
+        "\u2010": "-",  # Hyphen to hyphen-minus
+    }
+    verbatim_input = inp
+    for k, v in homoglyphs_mapping.items():
+        inp = inp.replace(k, v)
+    if inp != verbatim_input:
+        global korrektur_count
+        korrektur_count += 1
+        log.info(f"Buchtitel wurde angepaßt (Homoglyphen): '{inp}'")
+    return inp
+
+
+LEERZEICHEN_VOR_SATZENDE = re.compile(r"\s+([!?])$")
+
+
 def read_own_format(inp):
     # Sign,atur,Buchtitel,Verfasser,Zugang,,,Thema
     reader = csv.reader(inp, dialect="excel")
+    mit_kürzel = re.compile(r"\([\w\(]+?\)$")  # beste Methode die wir bisher haben, es gibt ein paar Ausreißer
+    sehen_staunen = re.compile(r"\s+\(sehen,\s*?staunen,\s*?wissen\)$", re.IGNORECASE)
     count = 0
+    global korrektur_count
+    korrektur_count = 0
     kartei = {}  # Karteinummer vorhanden und einmalig vorhanden
     waisen = []  # Keine Karteinummer
     duplikate = []  # Karteinummer gedoppelt
     for row in reader:
         if count > 0:
-            buchtitel, verfasser, karteinummer = row[2], row[3], row[4]
+            buchtitel, verfasser, karteinummer = row[2].strip(), row[3].strip(), row[4].strip()
+            # Homoglyphen behandeln, zur Verbesserung der Treffergenauigkeit (die Excel-Liste enthält da ein paar ... Artefakte)
+            buchtitel, verfasser = homoglyph_sanitize(buchtitel), homoglyph_sanitize(verfasser)
+            if m := sehen_staunen.search(buchtitel):
+                buchtitel = re.sub(sehen_staunen, "", buchtitel)
+                log.info(f"Buchtitel wurde angepaßt (sehen, staunen, wissen): '{buchtitel}'; war '{row[2]}'")
+                korrektur_count += 1
+            if m := mit_kürzel.search(buchtitel):
+                buchtitel = buchtitel.split("(")[0].strip()
+                log.info(f"Buchtitel wurde angepaßt (angehangene Systematik): '{buchtitel}'; war '{row[2]}'")
+                korrektur_count += 1
+            # Leerzeichen vor dem Satzende entfernen
+            if LEERZEICHEN_VOR_SATZENDE.search(buchtitel):
+                buchtitel = re.sub(LEERZEICHEN_VOR_SATZENDE, r"\1", buchtitel)
+                log.info(f"Buchtitel wurde angepaßt (Satzende): '{buchtitel}'; war '{row[2]}'")
+                korrektur_count += 1
             if karteinummer in {"?", ""}:
                 log.debug(f"Ignoriere temporär ungültige Karteinummer: '{karteinummer}'.")
                 waisen.append(
@@ -180,74 +221,136 @@ def read_own_format(inp):
                     karteinummer,
                 )
         count += 1
+    log.debug(f"{korrektur_count=}")
     return kartei, waisen, duplikate
+
+
+@cache
+def der_große_gleichmacher(inp):
+    return utils.default_process(inp)
 
 
 def abgleich_einzel_exemplare(katalog, kartei):
     global zugeordnete_karteinummern
-    # Diese Fälle sind am einfachsten. Wir haben exakt ein Exemplar, welches wir auch
+    # Diese Fälle sind am einfachsten. Wir haben exakt ein Exemplar, welches wir eventuell zuordnen können
     einzel_exemplare = [x for x in katalog if len(x["copies"]) == 1]
-    print(f"{len(einzel_exemplare)=}")
-    # print(f"{einzel_exemplare[0]!r}")
-    count = 0
-    exakte_treffer = {}
-    top_treffer = {}
-    gute_treffer = {}
-    akzeptable_treffer = {}
-    for buch in einzel_exemplare:
-        highest_ratio = -1
-        treffer = {}
-        for karteinummer, (buchtitel, verfasser, _) in kartei.items():
-            ratio = fuzz.token_set_ratio(buch["title"], buchtitel)
-            if ratio > 80 and ratio >= highest_ratio:
-                if ratio > highest_ratio:
-                    treffer = {}
-                highest_ratio = ratio
-                treffer[karteinummer] = (highest_ratio, buchtitel, buch,)
-        if treffer:
-            if len(treffer) > 1:
-                log.info("MEHRERE BEST-TREFFER: %d", len(treffer))
-                for karteinummer, (highest_ratio, buchtitel, buch) in treffer.items():
-                    log.info("[%s] '%s' (%2.2f) -> '%s'", karteinummer, buchtitel, highest_ratio, buch["title"])
-                continue
-            for karteinummer, (highest_ratio, buchtitel, buch) in treffer.items():
-                if highest_ratio == 100:
-                    exakte_treffer[karteinummer] = (
-                        highest_ratio,
-                        buchtitel,
-                        buch,
-                    )
-                    del kartei[karteinummer]
-                elif highest_ratio > 99:
-                    top_treffer[karteinummer] = (
-                        highest_ratio,
-                        buchtitel,
-                        buch,
-                    )
-                elif highest_ratio >= 90:
-                    gute_treffer[karteinummer] = (
-                        highest_ratio,
-                        buchtitel,
-                        buch,
-                    )
-                elif highest_ratio >= 80:
-                    akzeptable_treffer[karteinummer] = (
-                        highest_ratio,
-                        buchtitel,
-                        buch,
-                    )
-        count += 1
-    print(f"{len(exakte_treffer)=}")
-    print(f"{len(top_treffer)=}")
-    print(f"{len(gute_treffer)=}")
-    print(f"{len(akzeptable_treffer)=}")
-    top_ratio = 100 * ((len(exakte_treffer) + len(top_treffer)) / len(einzel_exemplare))
-    print(f"{top_ratio:2.2f} %")
+    mehrfach_exemplare = [x for x in katalog if len(x["copies"]) != 1]
+    assert len(einzel_exemplare) + len(mehrfach_exemplare) == len(katalog), "Beide Listen zusammen müssen exakt die Anzahl Elemente der Quellliste enthalten."
+    gesamtzahl_exemplare = len(einzel_exemplare) + len(mehrfach_exemplare)
+    log.debug(f"{len(kartei)=}")
+    log.debug(f"{len(einzel_exemplare)=} (von {gesamtzahl_exemplare})")
+    log.debug(f"{len(mehrfach_exemplare)=} (von {gesamtzahl_exemplare})")
     neuer_katalog = []
+    zu_löschen = []
+    # Exakte Treffer zuerst, damit die Liste der verbleibenden Kandidaten schön klein wird
+    for buch in einzel_exemplare:
+        for karteinummer, (buchtitel, verfasser, _) in kartei.items():
+            if buch["title"].strip() != buch["title"]:
+                log.debug("UNSTRIPPED (katalog): '%s'", buch["title"])
+            if buchtitel.strip() != buchtitel:
+                log.debug("UNSTRIPPED (kartei): '%s'", buchtitel)
+            if der_große_gleichmacher(buch["title"]) == der_große_gleichmacher(buchtitel):
+                del kartei[karteinummer]
+                zu_löschen.append(buch)
+                buch["karteinummern"] = [karteinummer]
+                neuer_katalog.append(buch)
+                zugeordnete_karteinummern[karteinummer] = buch
+                break  # innere for-Schleife
+    # Ein paar Debugausgaben
+    log.debug(f"{len(zu_löschen)=}")
+    log.debug(f"{len(katalog)=}")
+    log.debug(f"{len(neuer_katalog)=}")
+    # Katalogliste um jene Elemente bereinigen, die wir oben in neuer_katalog übernommen haben (dort inkl. Karteinummer)
+    for eintrag in zu_löschen:
+        katalog.remove(eintrag)
+    assert len(einzel_exemplare) + len(mehrfach_exemplare) == len(neuer_katalog) + len(
+        katalog
+    ), "Beide Listen zusammen müssen exakt die Anzahl Elemente der Quellliste enthalten."
+    log.debug(f"{len(katalog)=} (NACH LÖSCHUNG)")
+    log.debug(f"{len(neuer_katalog)} + {len(katalog)} = {len(neuer_katalog)+len(katalog)}")
+    # Nach der obigen Prüfung diese Elemente auch aus der Liste mit den Einzelexemplaren löschen
+    for eintrag in zu_löschen:
+        einzel_exemplare.remove(eintrag)
+    log.debug(f"{len(einzel_exemplare)=} (NACH LÖSCHUNG)")
+    zu_löschen = []  # Liste leeren, da wir hier quasi von vorn beginnen
+    # Top-Treffer (>=95%) als nächste
+    for attempt in range(5):
+        kartei_titel = {k: x[0].strip() for k, x in kartei.items()}
+        for buch in einzel_exemplare:
+            for karteinummer, titel in kartei_titel.items():
+                if karteinummer in zugeordnete_karteinummern:
+                    log.debug(f"LOGIKFEHLER: {karteinummer=} ist bereits zugeordnet und taucht dennoch in der Liste auf.")
+                if buch["title"].strip() != buch["title"]:
+                    log.debug("UNSTRIPPED (katalog): '%s'", buch["title"])
+                if buchtitel.strip() != buchtitel:
+                    log.debug("UNSTRIPPED (kartei): '%s'", buchtitel)
+            kandidaten = process.extract(buch["title"].strip(), kartei_titel, scorer=fuzz.WRatio, processor=der_große_gleichmacher, score_cutoff=95)
+            if kandidaten and len(kandidaten) == 1:
+                karteinummer = kandidaten[0][2]
+                del kartei_titel[karteinummer]
+                del kartei[karteinummer]
+                zu_löschen.append(buch)
+                buch["karteinummern"] = [karteinummer]
+                neuer_katalog.append(buch)
+                zugeordnete_karteinummern[karteinummer] = buch
+                continue
+        # Bereinigen
+        for eintrag in zu_löschen:
+            katalog.remove(eintrag)
+            einzel_exemplare.remove(eintrag)
+        for karteinummer in zugeordnete_karteinummern.keys():
+            if karteinummer in kartei:
+                del kartei[karteinummer]
+        log.debug(f"#{attempt+1}: {len(zu_löschen)=} (beste Treffer >=95% mit gewichtetem Vergleich)")
+        log.debug(f"#{attempt+1}: {len(kartei)=} (NACH LÖSCHUNG)")
+        log.debug(f"#{attempt+1}: {len(neuer_katalog)=} (NACH LÖSCHUNG)")
+        log.debug(f"#{attempt+1}: {len(einzel_exemplare)=} (NACH LÖSCHUNG)")
+        log.debug(f"#{attempt+1}: {len(zugeordnete_karteinummern)=} (ENDRESULTAT)")
+        if not zu_löschen:
+            log.info(f"#{attempt+1}: keine neuen Treffer, verlasse Schleife")
+            zu_löschen = []  # Liste leeren, da wir hier quasi von vorn beginnen
+            break
+        zu_löschen = []  # Liste leeren, da wir hier quasi von vorn beginnen
+    # Plausible Treffer (>=80%) unter Zuhilfename der Autoreninformation
+    kartei_titel = {k: x[0].strip() for k, x in kartei.items()}
+    for buch in einzel_exemplare:
+        for karteinummer, titel in kartei_titel.items():
+            if karteinummer in zugeordnete_karteinummern:
+                log.debug(f"LOGIKFEHLER: {karteinummer=} ist bereits zugeordnet und taucht dennoch in der Liste auf.")
+            if buch["title"].strip() != buch["title"]:
+                log.debug("UNSTRIPPED (katalog): '%s'", buch["title"])
+            if buchtitel.strip() != buchtitel:
+                log.debug("UNSTRIPPED (kartei): '%s'", buchtitel)
+        kandidaten = process.extract(buch["title"].strip(), kartei_titel, scorer=fuzz.WRatio, processor=der_große_gleichmacher, score_cutoff=80)
+        if kandidaten:
+            # print(f"{len(kandidaten)=}")
+            if len(kandidaten) == 1:
+                kandidat = kandidaten[0]
+                print(f"{kandidat=!r} -> '{buch["title"]}'")
+        # if kandidaten and len(kandidaten) == 1:
+        #     karteinummer = kandidaten[0][2]
+        #     del kartei_titel[karteinummer]
+        #     del kartei[karteinummer]
+        #     zu_löschen.append(buch)
+        #     buch["karteinummern"] = [karteinummer]
+        #     neuer_katalog.append(buch)
+        #     zugeordnete_karteinummern[karteinummer] = buch
+        #     continue
+    for eintrag in zu_löschen:
+        katalog.remove(eintrag)
+        einzel_exemplare.remove(eintrag)
+    for karteinummer in zugeordnete_karteinummern.keys():
+        if karteinummer in kartei:
+            del kartei[karteinummer]
+    # DEBUGGING
+    outfile = Path(__file__).resolve().parent / "neu.json"
+    with open(outfile, "w") as json_file:
+        json.dump(neuer_katalog, json_file, allow_nan=False, ensure_ascii=False, sort_keys=True, indent=4)
+
 
 def main(**kwargs):
     """ """
-    global log, cache
+    global log
     log = setup_logging(kwargs.get("verbose", 0))
     sbalist = kwargs.get("sbalist", None)
     ownlist = kwargs.get("ownlist", None)

@@ -1,7 +1,7 @@
 PYSCRIPTS:=bestandslistenabgleich.py
 
 abgleich: bestandslistenabgleich.py data/Bestandsliste_von_uns.csv
-	./$(firstword $^) -v $(filter-out $(firstword $^),$^)
+	./$(firstword $^) -vvv $(filter-out $(firstword $^),$^)
 
 lint: $(PYSCRIPTS)
 	ruff check $^
@@ -11,4 +11,10 @@ pretty: $(PYSCRIPTS)
 
 all: lint pretty
 
-.PHONY: abgleich all lint pretty
+clean: bestandslistenabgleich.py
+	rm -f -- ./$(patsubst %.py,%.log,$(firstword $^))
+
+Abgleich: clean abgleich
+
+.PHONY: abgleich all lint pretty clean Abgleich
+.NOTPARALLEL: Abgleich clean
