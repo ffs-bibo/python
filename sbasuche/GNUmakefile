@@ -1,10 +1,7 @@
 PYSCRIPTS:=sbasuche.py
 
 suche: ./sbasuche.py
-	$(firstword $^)
-
-notebook: ./sbasuche-prototyp.ipynb
-	uv run jupyter notebook $(firstword $^)
+	uv run $(firstword $^) -vv
 
 lint: $(PYSCRIPTS)
 	ruff check $^
@@ -14,4 +11,4 @@ pretty: $(PYSCRIPTS)
 
 all: lint pretty
 
-.PHONY: suche all lint pretty notebook
+.PHONY: suche all lint pretty

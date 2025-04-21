@@ -1,7 +1,7 @@
 PYSCRIPTS:=bestandslistenabgleich.py
 
 abgleich: bestandslistenabgleich.py data/Bestandsliste_von_uns.csv
-	./$(firstword $^) -vvv $(filter-out $(firstword $^),$^)
+	uv run ./$(firstword $^) -vvv $(filter-out $(firstword $^),$^)
 
 lint: $(PYSCRIPTS)
 	ruff check $^

@@ -19,7 +19,7 @@ from __future__ import (
 
 __author__ = "Oliver Schneider"
 __copyright__ = "2024, 2025 Oliver Schneider (assarbad.net), under the terms of the UNLICENSE"
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 __compatible__ = (
     (3, 12),
     (3, 13),
@@ -298,13 +298,17 @@ class SBASearch(object):
         newest_cache_dir = sorted(cached_searchhashes, key=lambda d: d.stat().st_mtime)[-1]
         cache_file_list = sorted([cache_file for cache_file in newest_cache_dir.glob("detail_????.html")])
         assert cache_file_list, f"Es wurde kein gültiges bereits zwischengespeichertes Verzeichnis gefunden (habe versucht: {newest_cache_dir})."
-        assert (
-            cache_file_list[0].name == "detail_0000.html"
-        ), f"Der erste Eintrag der Cache-List hätte 'detail_0000.html' sein sollen ({len(cache_file_list)=})."
+        item_total = len(cache_file_list)
+        if not newest_cache_dir.endswith(f".{item_total}"):
+            raise SBALogicError(f"Das neueste Cache-Verzeichnis ({newest_cache_dir}) endet nicht, wie erwartet, auf '.{item_total}'.")
+        if cache_file_list[0].name != "detail_0000.html":
+            raise SBALogicError(f"Der erste Eintrag der Cache-Liste hätte 'detail_0000.html' sein sollen ({len(cache_file_list)=}).")
+        if cache_file_list[-1].name != f"detail_{item_total-1:04}.html":
+            raise SBALogicError(f"Der letzte Eintrag der Cache-Liste hätte 'detail_{item_total-1:04}.html' sein sollen ({len(cache_file_list)=}).")
 
         def get_detail_url():
             for idx, cache_file in enumerate(cache_file_list):
-                yield idx, cache_file
+                yield idx, cache_file, item_total
 
         return get_detail_url()
 
@@ -343,7 +347,7 @@ class SBASearch(object):
 
         def get_detail_url():
             for idx in range(0, item_total):
-                yield idx, template_url.format(item_index=idx)
+                yield idx, template_url.format(item_index=idx), item_total
 
         return get_detail_url()
 
@@ -394,13 +398,13 @@ class SBASearch(object):
         return retval
 
     @cache
-    def get_cache_path(self, searchhash: str) -> Path:
-        retval = self.get_cache_basepath() / searchhash
+    def get_cache_path(self, searchhash: str, item_total: int) -> Path:
+        retval = self.get_cache_basepath() / f"{searchhash}.{item_total:04}"
         log.info("Cache-Pfad = %s", retval)
         return retval
 
     @cache
-    def get_cached_content(self, idx: int, url: Union[str, Path]):
+    def get_cached_content(self, idx: int, item_total: int, url: Union[str, Path]):
         force_cache = not isinstance(url, str)
         if not force_cache:
             parsed_url = urlparse(url)
@@ -408,7 +412,7 @@ class SBASearch(object):
             assert "&" in parsed_url.query, f"Es wurde ein '&' in der Query ({url=}) erwartet"
             assert "searchhash=" in parsed_url.query, f"Es wurde ein 'searchhash=' in der URL ({url=}) erwartet"
             searchhash = [x for x in url.split("?")[1].split("&") if x.startswith("searchhash=")][0].split("=")[1]
-            cache_path = self.get_cache_path(searchhash)
+            cache_path = self.get_cache_path(searchhash, item_total)
             cache_path.mkdir(parents=True, exist_ok=True)
             cache_filepath = cache_path / f"detail_{idx:04d}.html"
         else:
@@ -432,8 +436,8 @@ class SBASearch(object):
         time.sleep(delay / 1000)
         return details.text
 
-    def get_details_soup(self, idx: int, url: str):
-        details = self.get_cached_content(idx, url)
+    def get_details_soup(self, idx: int, item_total: int, url: str):
+        details = self.get_cached_content(idx, item_total, url)
         return BeautifulSoup(details, "html.parser")
 
 
@@ -504,6 +508,18 @@ class SBABookDetails(object):
         log.debug("Präfix für IDs: %s", prefix)
         raise SBALogicError(f"Die ID ({anyid!r}) stimmte nicht mit der Regex ({idre.pattern!r}) überein")
 
+    @staticmethod
+    def __titel_korrekturen(titel):
+        """\
+        Statische Korrekturen für den ermittelten Titel (um Hickser in den SBA-Daten abzufedern)
+        """
+        austausch = {
+                "Paul Klee,": "Paul Klee, Bilder träumen",
+                }
+        if titel in austausch:
+            return austausch[titel]
+        return titel
+
     def __parse(self):
         soup = self.soup
         prefix = self.prefix
@@ -530,7 +546,7 @@ class SBABookDetails(object):
             raise ValidationError(f"Nur ein Buchtitel wurde erwartet (habe {len(title)=})!")
         if not title:
             raise ValidationError(f"Buchtitel darf nicht leer sein ({title=!r})!")
-        self._attributes["title"] = title[0]
+        self._attributes["title"] = self.__titel_korrekturen(title[0])
         # Exzerpt/Inhaltsangabe (kann leer sein!)
         excerpt = tuple(x.get("content") for x in self.find_all(attrs={"property": f"og:description", "content": lambda x: x}))
         if excerpt:
@@ -663,7 +679,7 @@ class SBABookDetails(object):
             copies_rows = soup.select(f"table#{prefix}_MainView_UcDetailView_ucCatalogueCopyView_grdViewMediumCopies tr:has(td)")
             copies = []
             for row in copies_rows:
-                col_contents = [x.get_text().replace("\n", " ").strip() for x in row.select("tr td")]
+                col_contents = [x.get_text().replace("\n", " ").replace("\r", " ").strip().replace("  ", " ") for x in row.select("tr td")]
                 if len(col_contents) != len(copy_cols):
                     raise ValidationError(
                         f"Es wurde erwartet daß die Anzahl Spalten im Tabellenkopf mit der Anzahl Spalten in den Zeilen übereinstimmt ({len(copies_cells)=} != {len(copy_cols)=})."
@@ -723,8 +739,8 @@ def main(**kwargs):
     assert url is not None, f"Die Einstiegs-URL kann nicht 'nichts' (None) sein."
     search = SBASearch(url, cache)
     book_details = []
-    for idx, detail_url in search.items():
-        book = SBABookDetails(search.get_details_soup(idx, detail_url))
+    for idx, detail_url, item_total in search.items():
+        book = SBABookDetails(search.get_details_soup(idx, item_total, detail_url))
         book_details.append(book.to_json_ready_dict())
     with open(outfile, "w") as json_file:
         json.dump(book_details, json_file, allow_nan=False, ensure_ascii=False, sort_keys=True, indent=4)
