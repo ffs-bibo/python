@@ -19,7 +19,7 @@ from __future__ import (
 
 __author__ = "Oliver Schneider"
 __copyright__ = "2024, 2025 Oliver Schneider (assarbad.net), under the terms of the UNLICENSE"
-__version__ = "0.2.4"
+__version__ = "0.2.5"
 __compatible__ = (
     (3, 12),
     (3, 13),
@@ -299,7 +299,7 @@ class SBASearch(object):
         cache_file_list = sorted([cache_file for cache_file in newest_cache_dir.glob("detail_????.html")])
         assert cache_file_list, f"Es wurde kein gültiges bereits zwischengespeichertes Verzeichnis gefunden (habe versucht: {newest_cache_dir})."
         item_total = len(cache_file_list)
-        if not newest_cache_dir.endswith(f".{item_total}"):
+        if not str(newest_cache_dir).endswith(f".{item_total}"):
             raise SBALogicError(f"Das neueste Cache-Verzeichnis ({newest_cache_dir}) endet nicht, wie erwartet, auf '.{item_total}'.")
         if cache_file_list[0].name != "detail_0000.html":
             raise SBALogicError(f"Der erste Eintrag der Cache-Liste hätte 'detail_0000.html' sein sollen ({len(cache_file_list)=}).")
@@ -446,6 +446,7 @@ class SBABookDetails(object):
         "authors": lambda x: isinstance(x, tuple),  # 0..∞
         "title": lambda x: isinstance(x, str) and x,  # 1
         "excerpt": lambda x: x is None or (isinstance(x, str) and x),  # kann leer sein!
+        "series": lambda x: x is None or (isinstance(x, tuple) and len(x) > 0 and all(isinstance(e, str) for e in x)),  # kann leer sein!
         "responsibility": lambda x: isinstance(x, tuple),  # 0..∞?
         "publish_year": lambda x: isinstance(x, str) and x,  # 1
         "publisher": lambda x: isinstance(x, tuple),  # 0..1
@@ -529,6 +530,7 @@ class SBABookDetails(object):
         self._attributes["match_total"] = None
         self._attributes["number_copies"] = 0
         self._attributes["excerpt"] = None
+        self._attributes["series"] = None
         # Autoren/Beteiligte (0..∞)
         self._attributes["authors"] = tuple(
             x.get_text()
@@ -643,6 +645,18 @@ class SBABookDetails(object):
         if len(description) != 1:
             raise ValidationError(f"Es wurde eine Beschreibung erwartet (habe {len(description)=}).")
         self._attributes["description"] = description[0]
+        # Reihe (0..∞?)
+        series = tuple(
+            x.get_text().strip()
+            for x in self.find_all(
+                attrs={
+                    "id": re.compile(rf"{prefix}_MainView_UcDetailView_ucCatalogueDetailView_LbSeriesValue_LbSeries_[0-9]+$"),
+                }
+            )
+            if x.get_text().strip()
+        )
+        if series:
+            self._attributes["series"] = series
         # Treffernummer ermitteln
         match_number = [
             x.get_text().strip()
