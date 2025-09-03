@@ -18,7 +18,7 @@ from __future__ import (
 
 __author__ = "Oliver Schneider"
 __copyright__ = "2024, 2025 Oliver Schneider (assarbad.net), under the terms of the UNLICENSE"
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 __compatible__ = (
     (3, 12),
     (3, 13),
@@ -36,14 +36,12 @@ import os  # noqa: F401
 import re
 import sys
 from collections.abc import Iterable
-from contextlib import suppress
 from functools import cache
-from isbnlib import is_isbn13, is_isbn10, to_isbn13, canonical  # editions, meta, goom
 from pathlib import Path
 from rapidfuzz import fuzz, process, utils
 
 # Checking for compatibility with Python version
-if not sys.version_info[:2] in __compatible__:
+if sys.version_info[:2] not in __compatible__:
     sys.exit(
         "Dieses Skript ist nur mit folgenden Pythonversionen kompatibel: %s" % (", ".join(["%d.%d" % (z[0], z[1]) for z in __compatible__]))
     )  # pragma: no cover
@@ -176,7 +174,7 @@ def read_own_format(inp):
                 buchtitel = re.sub(sehen_staunen, "", buchtitel)
                 log.info(f"Buchtitel wurde angepaßt (sehen, staunen, wissen): '{buchtitel}'; war '{row[2]}'")
                 korrektur_count += 1
-            if m := mit_kürzel.search(buchtitel):
+            if mit_kürzel.search(buchtitel):
                 buchtitel = buchtitel.split("(")[0].strip()
                 log.info(f"Buchtitel wurde angepaßt (angehangene Systematik): '{buchtitel}'; war '{row[2]}'")
                 korrektur_count += 1
@@ -323,19 +321,13 @@ def abgleich_einzel_exemplare(katalog, kartei):
                 log.debug("UNSTRIPPED (kartei): '%s'", buchtitel)
         kandidaten = process.extract(buch["title"].strip(), kartei_titel, scorer=fuzz.WRatio, processor=der_große_gleichmacher, score_cutoff=80)
         if kandidaten:
-            # print(f"{len(kandidaten)=}")
-            if len(kandidaten) == 1:
-                kandidat = kandidaten[0]
-                print(f"{kandidat=!r} -> '{buch["title"]}'")
-        # if kandidaten and len(kandidaten) == 1:
-        #     karteinummer = kandidaten[0][2]
-        #     del kartei_titel[karteinummer]
-        #     del kartei[karteinummer]
-        #     zu_löschen.append(buch)
-        #     buch["karteinummern"] = [karteinummer]
-        #     neuer_katalog.append(buch)
-        #     zugeordnete_karteinummern[karteinummer] = buch
-        #     continue
+            for kandidat in kandidaten:
+                ...
+
+        # if kandidaten:
+        #     if len(kandidaten) == 1:
+        #         kandidat = kandidaten[0]
+        #         print(f"{kandidat=!r} -> '{buch["title"]}'")
     for eintrag in zu_löschen:
         katalog.remove(eintrag)
         einzel_exemplare.remove(eintrag)

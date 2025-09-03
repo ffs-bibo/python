@@ -19,7 +19,7 @@ from __future__ import (
 
 __author__ = "Oliver Schneider"
 __copyright__ = "2024, 2025 Oliver Schneider (assarbad.net), under the terms of the UNLICENSE"
-__version__ = "0.2.5"
+__version__ = "0.2.6"
 __compatible__ = (
     (3, 12),
     (3, 13),
@@ -45,9 +45,10 @@ from isbnlib import is_isbn13, is_isbn10, to_isbn13, canonical  # editions, meta
 from pathlib import Path
 from typing import Union, List, Optional
 from urllib.parse import urlparse
+from requests.exceptions import ConnectionError
 
 # Checking for compatibility with Python version
-if not sys.version_info[:2] in __compatible__:
+if sys.version_info[:2] not in __compatible__:
     sys.exit(
         "Dieses Skript ist nur mit folgenden Pythonversionen kompatibel: %s" % (", ".join(["%d.%d" % (z[0], z[1]) for z in __compatible__]))
     )  # pragma: no cover
@@ -74,6 +75,23 @@ def parse_args():
         dest="cache",
         const=True,
         help="Unterdrücke erneute Abfrage der Online-Quelle der SBA. Stattdessen wird der Cache bemüht (sofern verfügbar).",
+    )
+    parser.add_argument(
+        "-k",
+        "--keep-going",
+        action="store_const",
+        dest="keepgoing",
+        const=True,
+        help="Fahre fort, auch wenn einzelne Buchdetails nicht runtergeladen werden können (hilfreich um den Cache zu befüllen).",
+    )
+    parser.add_argument(
+        "-f",
+        "--download-from",
+        dest="dlfrom",
+        metavar="N",
+        help="Anzahl der Cache-Einträge für welche Treffer angenommen werden sollen; wenn gesetzt wird _nur_ heruntergeladen ohne JSON zu erzeugen!",
+        type=int,
+        default=0,
     )
     parser.add_argument(
         "-u",
@@ -146,6 +164,9 @@ class SBARequestError(RuntimeError): ...
 
 
 class SBALogicError(RuntimeError): ...
+
+
+class SBAUnavailable(RuntimeError): ...
 
 
 class SBASearch(object):
@@ -266,8 +287,8 @@ class SBASearch(object):
                     "__EVENTTARGET": "",
                     "__EVENTARGUMENT": "",
                     # Die gehen eigentlich normalerweise in die URI
-                    f"pagesize": "50",
-                    f"top": "y",
+                    "pagesize": "50",
+                    "top": "y",
                     # Wir schummeln hier ein wenig und hartkodieren einige der Formularfelder und deren Werte
                     f"{prefix}FirstSearchField": "Free",
                     f"{prefix}FirstSearchValue": "",
@@ -323,7 +344,7 @@ class SBASearch(object):
         # Hier sollten wir einen searchhash vorfinden
         assert (
             "searchhash=OCLC_" in self.response.url
-        ), f"Es wurde erwartet einen 'searchhash' der mit 'OCLC_' beginnt in der URL für die Ergebnisliste vorzufinden."
+        ), "Es wurde erwartet einen 'searchhash' der mit 'OCLC_' beginnt in der URL für die Ergebnisliste vorzufinden."
         log.info("URL des Suchergebnisses: %s (Status: %d); Bytes: %d", self.response.url, self.response.status_code, len(self.response.text))
         soup = BeautifulSoup(self.response.text, "html.parser")
         item_total = soup.find_all("span", {"id": lambda x: x and x.endswith("_TotalItemsLabel")})
@@ -341,7 +362,7 @@ class SBASearch(object):
         result_url = item_links[0].get("href", None)
         assert result_url is not None, f"Konnte das 'href'-Attribut des ersten Ergebnislinks nicht auslesen: {item_links[0]=!r}"
         assert "&detail=0&" in result_url, f"Der erste Ergebnislink sollte 'detail=0' beinhalten: {result_url=!r}"
-        assert "searchhash=OCLC_" in result_url, f"Es wurde erwartet einen 'searchhash' der mit 'OCLC_' beginnt im ersten Ergebnislink vorzufinden."
+        assert "searchhash=OCLC_" in result_url, "Es wurde erwartet einen 'searchhash' der mit 'OCLC_' beginnt im ersten Ergebnislink vorzufinden."
         template_url = result_url.replace("&detail=0&", "&detail={item_index}&")
         log.info("Die ermittelte _generische_ URL für Ergebnisdetails lautet: %s", template_url)
 
@@ -404,17 +425,20 @@ class SBASearch(object):
         return retval
 
     @cache
+    def get_cache_filepath(self, idx: int, item_total: int, url: Union[str, Path]) -> Path:
+        parsed_url = urlparse(url)
+        assert parsed_url.query, f"Die Query in der URL hätte nicht leer sein dürfen! ({url=})"
+        assert "&" in parsed_url.query, f"Es wurde ein '&' in der Query ({url=}) erwartet"
+        assert "searchhash=" in parsed_url.query, f"Es wurde ein 'searchhash=' in der URL ({url=}) erwartet"
+        searchhash = [x for x in url.split("?")[1].split("&") if x.startswith("searchhash=")][0].split("=")[1]
+        cache_path = self.get_cache_path(searchhash, item_total)
+        cache_path.mkdir(parents=True, exist_ok=True)
+        return cache_path / f"detail_{idx:04d}.html"
+
     def get_cached_content(self, idx: int, item_total: int, url: Union[str, Path]):
         force_cache = not isinstance(url, str)
         if not force_cache:
-            parsed_url = urlparse(url)
-            assert parsed_url.query, f"Die Query in der URL hätte nicht leer sein dürfen! ({url=})"
-            assert "&" in parsed_url.query, f"Es wurde ein '&' in der Query ({url=}) erwartet"
-            assert "searchhash=" in parsed_url.query, f"Es wurde ein 'searchhash=' in der URL ({url=}) erwartet"
-            searchhash = [x for x in url.split("?")[1].split("&") if x.startswith("searchhash=")][0].split("=")[1]
-            cache_path = self.get_cache_path(searchhash, item_total)
-            cache_path.mkdir(parents=True, exist_ok=True)
-            cache_filepath = cache_path / f"detail_{idx:04d}.html"
+            cache_filepath = self.get_cache_filepath(idx, item_total, url)
         else:
             cache_filepath = url
         with suppress(FileNotFoundError):
@@ -497,8 +521,19 @@ class SBABookDetails(object):
     @property
     @cache
     def prefix(self):
-        anyelem = self.soup.find_all("div", {"id": lambda x: x and x.endswith("_MainView_UcDetailView_CatalogueDetailView")})
+        pfx_sentinel = "_MainView_UcDetailView_CatalogueDetailView"
+        unavailable_sentinel = {
+            "Es ist ein Fehler aufgetreten.",
+            "Versuchen Sie es zu einem späteren Zeitpunkt",
+            "Der Schulbibliothekskatalog ist momentan nicht erreichbar",
+        }
+        anyelem = self.soup.find_all("div", {"id": lambda x: x and x.endswith(pfx_sentinel)})
         if len(anyelem) != 1:
+            soupstr = str(self.soup)
+            log.debug("Sentinel existiert in Soup? -> %s (Länge: %d)", pfx_sentinel in soupstr, len(soupstr))
+            log.critical("Es wird erwartet daß nur ein Element mit der gesuchten ID existiert (anyelem=%r)", anyelem)
+            if any(x in soupstr for x in unavailable_sentinel):
+                raise SBAUnavailable("SBA Katalogsuche nicht erreichbar.")
             raise ValidationError(f"Es wird erwartet daß nur ein Element mit der gesuchten ID existiert ({anyelem=!r})")
         anyelem = anyelem[0]
         anyid = anyelem.get("id")
@@ -506,7 +541,6 @@ class SBABookDetails(object):
         if match := idre.match(anyid):
             return match.group(1)
         log.critical("Die ID (%r) stimmte nicht mit der Regex (%r) überein", anyid, idre.pattern)
-        log.debug("Präfix für IDs: %s", prefix)
         raise SBALogicError(f"Die ID ({anyid!r}) stimmte nicht mit der Regex ({idre.pattern!r}) überein")
 
     @staticmethod
@@ -515,8 +549,8 @@ class SBABookDetails(object):
         Statische Korrekturen für den ermittelten Titel (um Hickser in den SBA-Daten abzufedern)
         """
         austausch = {
-                "Paul Klee,": "Paul Klee, Bilder träumen",
-                }
+            # "Paul Klee,": "Paul Klee, Bilder träumen",
+        }
         if titel in austausch:
             return austausch[titel]
         return titel
@@ -543,14 +577,14 @@ class SBABookDetails(object):
             if x.get_text().strip()
         )
         # Buchtitel (1)
-        title = [x.get("content").strip() for x in self.find_all(xmltype="meta", attrs={"property": f"og:title", "content": lambda x: x})]
+        title = [x.get("content").strip() for x in self.find_all(xmltype="meta", attrs={"property": "og:title", "content": lambda x: x})]
         if len(title) != 1:
             raise ValidationError(f"Nur ein Buchtitel wurde erwartet (habe {len(title)=})!")
         if not title:
             raise ValidationError(f"Buchtitel darf nicht leer sein ({title=!r})!")
         self._attributes["title"] = self.__titel_korrekturen(title[0])
         # Exzerpt/Inhaltsangabe (kann leer sein!)
-        excerpt = tuple(x.get("content") for x in self.find_all(attrs={"property": f"og:description", "content": lambda x: x}))
+        excerpt = tuple(x.get("content") for x in self.find_all(attrs={"property": "og:description", "content": lambda x: x}))
         if excerpt:
             if len(excerpt) != 1:
                 raise ValidationError(f"Nur eine Inhaltsangabe wurde erwartet (habe {len(excerpt)=})!")
@@ -696,7 +730,7 @@ class SBABookDetails(object):
                 col_contents = [x.get_text().replace("\n", " ").replace("\r", " ").strip().replace("  ", " ") for x in row.select("tr td")]
                 if len(col_contents) != len(copy_cols):
                     raise ValidationError(
-                        f"Es wurde erwartet daß die Anzahl Spalten im Tabellenkopf mit der Anzahl Spalten in den Zeilen übereinstimmt ({len(copies_cells)=} != {len(copy_cols)=})."
+                        f"Es wurde erwartet daß die Anzahl Spalten im Tabellenkopf mit der Anzahl Spalten in den Zeilen übereinstimmt ({len(col_contents)=} != {len(copy_cols)=})."
                     )
                 copies.append(dict(zip(copy_cols, col_contents)))
             self._attributes["copies"] = copies
@@ -745,19 +779,60 @@ def main(**kwargs):
     """\
     Die Hauptfunktion
     """
-    global log, cache
+    global log, cache, dlfrom, keepgoing
     log = setup_logging(kwargs.get("verbose", 0))
     cache = kwargs.get("cache", None)
+    keepgoing = kwargs.get("keepgoing", None)
+    dlfrom = kwargs.get("dlfrom", 0)
     outfile = kwargs.get("outfile", Path(__file__).resolve().parent / "output.json")
     url = kwargs.get("url", None)
-    assert url is not None, f"Die Einstiegs-URL kann nicht 'nichts' (None) sein."
+    assert url is not None, "Die Einstiegs-URL kann nicht 'nichts' (None) sein."
     search = SBASearch(url, cache)
+    missing_idxs = set()
     book_details = []
-    for idx, detail_url, item_total in search.items():
-        book = SBABookDetails(search.get_details_soup(idx, item_total, detail_url))
-        book_details.append(book.to_json_ready_dict())
-    with open(outfile, "w") as json_file:
-        json.dump(book_details, json_file, allow_nan=False, ensure_ascii=False, sort_keys=True, indent=4)
+    try:
+        for idx, detail_url, item_total in search.items():
+            if dlfrom > idx:
+                continue
+            missing_idxs.add(idx)
+            cache_filepath = search.get_cache_filepath(idx, item_total, detail_url)
+            retries = 5
+            try:
+                for attempt in range(retries):
+                    try:
+                        if attempt > 0:
+                            log.debug("Versuch %d: %s", attempt, detail_url)
+                        soup = search.get_details_soup(idx, item_total, detail_url)
+                        book = SBABookDetails(soup)
+                        book_details.append(book.to_json_ready_dict())
+                        missing_idxs.discard(idx)
+                        break
+                    except (SBAUnavailable, ConnectionError):
+                        if attempt + 1 < retries:
+                            delay = random.choice(range(3500, 15000)) / 1000  # in Sekunden
+                            log.debug("Verzögerung % 2.3f Sekunden bis zu nächstem Versuch.", delay)
+                            time.sleep(delay)
+                            with suppress(FileNotFoundError):
+                                cache_filepath.unlink()
+                                log.debug("Cachedatei %s gelöscht!", cache_filepath)
+                            continue
+                        if keepgoing:
+                            log.error("Es trat ein Fehler beim Laden von %s auf. Fahre dennoch fort.", detail_url)
+                            break
+                        raise
+            except (ValidationError, SBARequestError, SBALogicError):
+                log.critical("Angefragte URL: %s (Index: %d von %d)", detail_url, idx, item_total)
+                with suppress(FileNotFoundError):
+                    cache_filepath.unlink()
+                    log.debug("Cachedatei %s gelöscht!", cache_filepath)
+                raise
+        if dlfrom != 0:
+            return
+        with open(outfile, "w") as json_file:
+            json.dump(book_details, json_file, allow_nan=False, ensure_ascii=False, sort_keys=True, indent=4)
+    except BaseException:
+        log.critical("Fehlende Elemente mit Index: %r", missing_idxs)
+        raise
 
 
 if __name__ == "__main__":

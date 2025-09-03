@@ -1,6 +1,6 @@
 [project]
 name = "bestandslistenabgleich"
-version = "0.1.4"
+version = "0.1.5"
 description = "Kleines Tool um die SBA-Bestandsliste mit unserer eigenen Liste und der DNB abzugleichen"
 readme = "README.md"
 requires-python = ">=3.12"
