@@ -81,6 +81,16 @@ def parse_args():
         default=Path(__file__).parent.parent / "sbasuche/output.json",
     )
     parser.add_argument(
+        "-c",
+        "--cutoff-score",
+        action="store",
+        dest="cutoff",
+        metavar="PROZENTWERT",
+        type=int,
+        help="Der Schwellwert ab bis zu dem gewichtet ähnliche Treffer als identisch angenommen werden.",
+        default=95,
+    )
+    parser.add_argument(
         action="store",
         dest="ownlist",
         metavar="EIGENELISTE",
@@ -170,7 +180,7 @@ def read_own_format(inp):
             buchtitel, verfasser, karteinummer = row[2].strip(), row[3].strip(), row[4].strip()
             # Homoglyphen behandeln, zur Verbesserung der Treffergenauigkeit (die Excel-Liste enthält da ein paar ... Artefakte)
             buchtitel, verfasser = homoglyph_sanitize(buchtitel), homoglyph_sanitize(verfasser)
-            if m := sehen_staunen.search(buchtitel):
+            if sehen_staunen.search(buchtitel):
                 buchtitel = re.sub(sehen_staunen, "", buchtitel)
                 log.info(f"Buchtitel wurde angepaßt (sehen, staunen, wissen): '{buchtitel}'; war '{row[2]}'")
                 korrektur_count += 1
@@ -236,11 +246,11 @@ def abgleich_einzel_exemplare(katalog, kartei):
     assert len(einzel_exemplare) + len(mehrfach_exemplare) == len(katalog), "Beide Listen zusammen müssen exakt die Anzahl Elemente der Quellliste enthalten."
     gesamtzahl_exemplare = len(einzel_exemplare) + len(mehrfach_exemplare)
     log.debug(f"{len(kartei)=}")
-    log.debug(f"{len(einzel_exemplare)=} (von {gesamtzahl_exemplare})")
-    log.debug(f"{len(mehrfach_exemplare)=} (von {gesamtzahl_exemplare})")
+    log.debug(f"{len(einzel_exemplare)=} (von {gesamtzahl_exemplare=})")
+    log.debug(f"{len(mehrfach_exemplare)=} (von {gesamtzahl_exemplare=})")
     neuer_katalog = []
     zu_löschen = []
-    # Exakte Treffer zuerst, damit die Liste der verbleibenden Kandidaten schön klein wird
+    # Exakte Treffer zuerst, damit die Liste der verbleibenden Kandidaten schön "klein" wird
     for buch in einzel_exemplare:
         for karteinummer, (buchtitel, verfasser, _) in kartei.items():
             if buch["title"].strip() != buch["title"]:
@@ -255,26 +265,31 @@ def abgleich_einzel_exemplare(katalog, kartei):
                 zugeordnete_karteinummern[karteinummer] = buch
                 break  # innere for-Schleife
     # Ein paar Debugausgaben
-    log.debug(f"{len(zu_löschen)=}")
-    log.debug(f"{len(katalog)=}")
-    log.debug(f"{len(neuer_katalog)=}")
+    log.debug(f"{len(zu_löschen)=} (alter Katalog; Eingabedaten)")
+    log.debug(f"{len(katalog)=} (sollte {gesamtzahl_exemplare=} entsprechen)")
+    log.debug(f"{len(neuer_katalog)=} (mit hoher Sicherheit zugeordnete Exemplare)")
     # Katalogliste um jene Elemente bereinigen, die wir oben in neuer_katalog übernommen haben (dort inkl. Karteinummer)
     for eintrag in zu_löschen:
         katalog.remove(eintrag)
     assert len(einzel_exemplare) + len(mehrfach_exemplare) == len(neuer_katalog) + len(
         katalog
     ), "Beide Listen zusammen müssen exakt die Anzahl Elemente der Quellliste enthalten."
-    log.debug(f"{len(katalog)=} (NACH LÖSCHUNG)")
-    log.debug(f"{len(neuer_katalog)} + {len(katalog)} = {len(neuer_katalog)+len(katalog)}")
+    log.debug(f"{len(katalog)=} (NACH LÖSCHUNG von {len(zu_löschen)=} Elementen)")
+    log.debug(f"{len(neuer_katalog)} + {len(katalog)} = {len(neuer_katalog)+len(katalog)} (sicher zugeordnet + verbleibend = gesamt)")
     # Nach der obigen Prüfung diese Elemente auch aus der Liste mit den Einzelexemplaren löschen
     for eintrag in zu_löschen:
         einzel_exemplare.remove(eintrag)
-    log.debug(f"{len(einzel_exemplare)=} (NACH LÖSCHUNG)")
+    log.debug(f"{len(einzel_exemplare)=} (NACH LÖSCHUNG von {len(zu_löschen)=} Elementen)")
     zu_löschen = []  # Liste leeren, da wir hier quasi von vorn beginnen
-    # Top-Treffer (>=95%) als nächste
+    # Schwellwertliste in umgekehrter Reihenfolge
+    cutoff_thresholds = [cutoff]
+    if cutoff < 100:
+        cutoff_thresholds = sorted(range(cutoff, 100), reverse=True)
+    # Top-Treffer (>=<cutoff>%) als nächste
     for attempt in range(5):
         kartei_titel = {k: x[0].strip() for k, x in kartei.items()}
         for buch in einzel_exemplare:
+            treffer = None
             for karteinummer, titel in kartei_titel.items():
                 if karteinummer in zugeordnete_karteinummern:
                     log.debug(f"LOGIKFEHLER: {karteinummer=} ist bereits zugeordnet und taucht dennoch in der Liste auf.")
@@ -282,15 +297,21 @@ def abgleich_einzel_exemplare(katalog, kartei):
                     log.debug("UNSTRIPPED (katalog): '%s'", buch["title"])
                 if buchtitel.strip() != buchtitel:
                     log.debug("UNSTRIPPED (kartei): '%s'", buchtitel)
-            kandidaten = process.extract(buch["title"].strip(), kartei_titel, scorer=fuzz.WRatio, processor=der_große_gleichmacher, score_cutoff=95)
-            if kandidaten and len(kandidaten) == 1:
-                karteinummer = kandidaten[0][2]
-                del kartei_titel[karteinummer]
-                del kartei[karteinummer]
-                zu_löschen.append(buch)
-                buch["karteinummern"] = [karteinummer]
-                neuer_katalog.append(buch)
-                zugeordnete_karteinummern[karteinummer] = buch
+            for score_limit in cutoff_thresholds:  # beginnend von der höchsten Wahrscheinlichkeit
+                kandidaten = process.extract(
+                    buch["title"].strip(), kartei_titel, scorer=fuzz.WRatio, processor=der_große_gleichmacher, score_cutoff=score_limit
+                )
+                if kandidaten and len(kandidaten) == 1:
+                    karteinummer = kandidaten[0][2]
+                    del kartei_titel[karteinummer]
+                    del kartei[karteinummer]
+                    zu_löschen.append(buch)
+                    buch["karteinummern"] = [karteinummer]
+                    buch["treffer_wahrscheinlichkeit"] = treffer = score_limit
+                    neuer_katalog.append(buch)
+                    zugeordnete_karteinummern[karteinummer] = buch
+                    break
+            if treffer:
                 continue
         # Bereinigen
         for eintrag in zu_löschen:
@@ -299,7 +320,7 @@ def abgleich_einzel_exemplare(katalog, kartei):
         for karteinummer in zugeordnete_karteinummern.keys():
             if karteinummer in kartei:
                 del kartei[karteinummer]
-        log.debug(f"#{attempt+1}: {len(zu_löschen)=} (beste Treffer >=95% mit gewichtetem Vergleich)")
+        log.debug(f"#{attempt+1}: {len(zu_löschen)=} (beste Treffer >={cutoff}% mit gewichtetem Vergleich)")
         log.debug(f"#{attempt+1}: {len(kartei)=} (NACH LÖSCHUNG)")
         log.debug(f"#{attempt+1}: {len(neuer_katalog)=} (NACH LÖSCHUNG)")
         log.debug(f"#{attempt+1}: {len(einzel_exemplare)=} (NACH LÖSCHUNG)")
@@ -342,14 +363,20 @@ def abgleich_einzel_exemplare(katalog, kartei):
 
 def main(**kwargs):
     """ """
-    global log
+    global log, cutoff
     log = setup_logging(kwargs.get("verbose", 0))
+    cutoff = kwargs.get("cutoff")
+    if cutoff < 90:
+        log.warning("Schwellwerte unter %d %% sind eher unangemessen. Rechne mit vielen falschen Treffern!", cutoff)
+    if cutoff >= 100:
+        cutoff = 99
+        log.warning("Schwellwerte von 100 %% oder darüber ergeben keinen Sinn. Wurde auf %d %% korrigiert.", cutoff)
     sbalist = kwargs.get("sbalist", None)
     ownlist = kwargs.get("ownlist", None)
     katalog, kartei, waisen, duplikate = None, None, None, None
     with open(sbalist, "r") as json_file:
         katalog = json.load(json_file)
-    print(f"{len(katalog)=}")
+    log.info(f"{len(katalog)=} (SBA-seitig)")
     with open(ownlist, "r") as owncsv:
         kartei, waisen, duplikate = read_own_format(owncsv)
     if katalog is None or not isinstance(katalog, Iterable):
