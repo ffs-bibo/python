@@ -14,7 +14,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "isbnlib", specifier = ">=3.10" },
-    { name = "rapidfuzz", specifier = ">=3.13" },
+    { name = "rapidfuzz", specifier = ">=3.14" },
 ]
 
 [[package]]

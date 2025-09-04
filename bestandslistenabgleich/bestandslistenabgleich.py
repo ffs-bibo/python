@@ -5,7 +5,7 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #     "isbnlib>=3.10",
-#     "RapidFuzz>=3.13",
+#     "RapidFuzz>=3.14",
 # ]
 # ///
 from __future__ import (
