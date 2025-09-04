@@ -472,12 +472,12 @@ class SBABookDetails(object):
         "excerpt": lambda x: x is None or (isinstance(x, str) and x),  # kann leer sein!
         "series": lambda x: x is None or (isinstance(x, tuple) and len(x) > 0 and all(isinstance(e, str) for e in x)),  # kann leer sein!
         "responsibility": lambda x: isinstance(x, tuple),  # 0..∞?
-        "publish_year": lambda x: isinstance(x, str) and x,  # 1
+        "publish_year": lambda x: x is None or (isinstance(x, str) and x),  # 1 (ggf. nicht vorhanden, falls nicht verfügbar)
         "publisher": lambda x: isinstance(x, tuple),  # 0..1
-        "systematics": lambda x: isinstance(x, tuple) and len(x) > 0 and all(isinstance(e, str) for e in x),  # 1..∞?
+        "systematics": lambda x: x is None or (isinstance(x, tuple) and len(x) > 0 and all(isinstance(e, str) for e in x)),  # 1..∞? (ggf. nicht vorhanden, falls nicht verfügbar)
         "subject_type": lambda x: isinstance(x, tuple) and all(isinstance(e, str) for e in x),  # 0..∞?
         "isbn": lambda x: isinstance(x, tuple) and len(x) in {0, 1},  # 0..1
-        "description": lambda x: isinstance(x, str) and x,  # 1
+        "description": lambda x: x is None or (isinstance(x, str) and x),  # 1 (ggf. nicht vorhanden, falls nicht verfügbar)
         "match_entry": lambda x: isinstance(x, int) or x is None,
         "match_index": lambda x: isinstance(x, int) or x is None,
         "match_total": lambda x: isinstance(x, int) or x is None,
@@ -557,6 +557,7 @@ class SBABookDetails(object):
 
     def __parse(self):
         soup = self.soup
+        soupstr = str(soup)
         prefix = self.prefix
         # Vorbelegungen für Werte die mglw. nicht vorhanden sind
         self._attributes["match_entry"] = None
@@ -610,8 +611,9 @@ class SBABookDetails(object):
             if x.get_text().strip()
         )
         if len(publish_year) != 1:
-            raise ValidationError(f"Es wurde ein Erscheinungsjahr erwartet (habe {len(publish_year)=}).")
-        self._attributes["publish_year"] = publish_year[0]
+            if "nicht verfügbar" not in soupstr:
+                raise ValidationError(f"Es wurde ein Erscheinungsjahr erwartet (habe {len(publish_year)=}).")
+        self._attributes["publish_year"] = publish_year[0] if publish_year else None
         # Ort, Verlag/Herausgeber/Hersteller (0..1)
         self._attributes["publisher"] = tuple(
             x.get_text()
@@ -634,8 +636,9 @@ class SBABookDetails(object):
             if x.get_text().strip()
         )
         if not systematics:
-            raise ValidationError(f"Es wurde mindestens eine Systematik erwartet (habe {len(systematics)=}).")
-        self._attributes["systematics"] = systematics
+            if "nicht verfügbar" not in soupstr:
+                raise ValidationError(f"Es wurde mindestens eine Systematik erwartet (habe {len(systematics)=}).")
+        self._attributes["systematics"] = systematics if systematics else None
         # Interessenkreis (0..∞?)
         self._attributes["subject_type"] = tuple(
             x.get_text().strip()
@@ -677,8 +680,9 @@ class SBABookDetails(object):
             if x.get_text().strip()
         )
         if len(description) != 1:
-            raise ValidationError(f"Es wurde eine Beschreibung erwartet (habe {len(description)=}).")
-        self._attributes["description"] = description[0]
+            if "nicht verfügbar" not in soupstr:
+                raise ValidationError(f"Es wurde eine Beschreibung erwartet (habe {len(description)=}).")
+        self._attributes["description"] = description[0] if description else None
         # Reihe (0..∞?)
         series = tuple(
             x.get_text().strip()
