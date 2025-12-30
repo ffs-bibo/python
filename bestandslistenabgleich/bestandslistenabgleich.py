@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run
+#!/usr/bin/env -S uv run --script --quiet
 # -*- coding: utf-8 -*-
 # vim: set autoindent smartindent softtabstop=4 tabstop=4 shiftwidth=4 expandtab:
 # /// script
@@ -22,6 +22,7 @@ __version__ = "0.1.5"
 __compatible__ = (
     (3, 12),
     (3, 13),
+    (3, 14),
 )
 __doc__ = """
 ======================== 
